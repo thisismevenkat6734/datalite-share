@@ -1,8 +1,15 @@
-/* =========================================================
-   DATALITE SHARE
-   File: script.js
-   Foundation: Firebase Authentication + Firestore
-   ========================================================= */
+/*
+ * DataLite Share
+ * Firebase project: celebration-of-life-d3dfa
+ * Version: 1.0.0 - P2P foundation
+ *
+ * Uses separate DataLite paths and collections.
+ * No Cloud Storage is used for file transfer.
+ *
+ * Current transfer mode:
+ * WebRTC DataChannel + in-memory receiver buffer.
+ * Not suitable for very large files yet.
+ */
 
 import { initializeApp } from
   "https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js";
@@ -10,7 +17,8 @@ import { initializeApp } from
 import {
   getAuth,
   signInAnonymously,
-  onAuthStateChanged
+  onAuthStateChanged,
+  signOut
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
 
 import {
@@ -18,71 +26,129 @@ import {
   doc,
   getDoc,
   setDoc,
-  getDocs,
   collection,
   query,
   where,
+  limit,
+  getDocs,
   serverTimestamp,
-  limit
+  updateDoc
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 
-/* ---------------------------------------------------------
-   FIREBASE CONFIGURATION
-   Existing Celebration of Life Firebase project
-   --------------------------------------------------------- */
+import {
+  getDatabase,
+  ref,
+  set,
+  get,
+  update,
+  remove,
+  onValue,
+  onChildAdded,
+  onDisconnect,
+  push,
+  runTransaction
+} from "https://www.gstatic.com/firebasejs/11.10.0/firebase-database.js";
+
+/* -------------------- CONFIGURATION -------------------- */
 
 const firebaseConfig = {
-  apiKey: "AIzaSyCm2ZwhbLg6SSY2qwAiOdfrMDx1i8sJjIQ",
+  apiKey: "AIzaSyCm2ZwhbLg6SSY2qwAiOdMDx1i8sJjIQ",
   authDomain: "celebration-of-life-d3dfa.firebaseapp.com",
   projectId: "celebration-of-life-d3dfa",
   storageBucket: "celebration-of-life-d3dfa.firebasestorage.app",
   messagingSenderId: "808280368245",
   appId: "1:808280368245:web:a92fec777882dbf61a043c",
-  measurementId: "G-PX41M3M7S5"
+  measurementId: "G-PX41M3M7S5",
+  databaseURL:
+    "https://celebration-of-life-d3dfa-default-rtdb.asia-southeast1.firebasedatabase.app/"
 };
-
-/* ---------------------------------------------------------
-   INITIALIZATION
-   --------------------------------------------------------- */
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const rtdb = getDatabase(app);
 
-const COLLECTIONS = {
-  users: "dataliteShareUsers",
-  usernames: "dataliteShareUsernames"
+const USERS = "dataliteShareUsers";
+const USERNAMES = "dataliteShareUsernames";
+const ROOT = "dataliteShare";
+
+const CHUNK_SIZE = 16 * 1024;
+const MAX_BUFFERED_AMOUNT = 1024 * 1024;
+const MAX_IN_MEMORY_FILE_SIZE = 100 * 1024 * 1024;
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
+  ]
 };
+
+/* -------------------- STATE -------------------- */
 
 const state = {
   user: null,
   profile: null,
+  peer: null,
+  channel: null,
+  activeRequestId: null,
+  activeRole: null,
   selectedFiles: [],
-  receiver: null,
-  qrScanner: null,
-  cameraStream: null,
-  busy: false
+  receivedChunks: [],
+  receivedBytes: 0,
+  expectedBytes: 0,
+  currentFile: null,
+  sending: false,
+  cancelled: false,
+  incomingRequests: new Map(),
+  unsubscribePresence: null,
+  unsubscribeRequests: null,
+  unsubscribeSignals: null,
+  transferStartedAt: 0,
+  sentBytes: 0,
+  totalBytes: 0
 };
+
+/* -------------------- DOM HELPERS -------------------- */
 
 const $ = (id) => document.getElementById(id);
 
-/* ---------------------------------------------------------
-   UTILITIES
-   --------------------------------------------------------- */
+function setText(id, value) {
+  const el = $(id);
+  if (el) el.textContent = String(value);
+}
 
-function notify(message, type = "success") {
-  const area = $("notificationArea");
-  if (!area) return;
+function setValue(id, value) {
+  const el = $(id);
+  if (el) el.value = value;
+}
 
-  const item = document.createElement("div");
-  item.className = `notification ${type}`;
-  item.textContent = message;
+function show(id, visible = true) {
+  const el = $(id);
+  if (el) el.hidden = !visible;
+}
 
-  area.appendChild(item);
+function setStatus(message) {
+  const ids = [
+    "statusMessage",
+    "connectionStatus",
+    "transferStatus"
+  ];
 
-  setTimeout(() => {
-    item.remove();
-  }, 4500);
+  ids.forEach(id => {
+    if ($(id)) setText(id, message);
+  });
+
+  console.info("[DataLite]", message);
+}
+
+function notify(message) {
+  setStatus(message);
+  if ("Notification" in window &&
+      Notification.permission === "granted") {
+    try {
+      new Notification("DataLite Share", { body: message });
+    } catch (_) {}
+  }
 }
 
 function formatBytes(bytes) {
@@ -94,873 +160,1233 @@ function formatBytes(bytes) {
     units.length - 1
   );
 
-  return `${(bytes / Math.pow(1024, index)).toFixed(2)} ${units[index]}`;
+  return (
+    (bytes / Math.pow(1024, index)).toFixed(2) +
+    " " +
+    units[index]
+  );
 }
 
-function validUsername(value) {
-  return /^[a-zA-Z0-9_]{3,20}$/.test(value);
+function safeUsername(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "")
+    .slice(0, 20);
 }
 
-function createUserCode() {
-  const random = crypto.getRandomValues(new Uint32Array(1))[0];
-  return `DL${random.toString(36).toUpperCase().padStart(7, "0")}`;
+function randomCode(length = 8) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+
+  return Array.from(bytes)
+    .map(byte => chars[byte % chars.length])
+    .join("");
 }
 
-function safeText(element, value) {
-  if (element) element.textContent = value ?? "";
+function getErrorMessage(error) {
+  console.error(error);
+  return error?.message || "Something went wrong.";
 }
 
-function setButtonLoading(button, loading, normalText) {
-  if (!button) return;
+/* -------------------- AUTHENTICATION -------------------- */
 
-  button.disabled = loading;
-  button.textContent = loading ? "Please wait..." : normalText;
-}
+async function authenticate() {
+  if (auth.currentUser) return auth.currentUser;
 
-/* ---------------------------------------------------------
-   NETWORK STATUS
-   --------------------------------------------------------- */
-
-function updateNetworkStatus() {
-  const element = $("networkStatus");
-  if (!element) return;
-
-  const online = navigator.onLine;
-
-  element.innerHTML = `
-    <span class="status-dot"
-      style="background:${online ? "#36e6a0" : "#ff6279"}">
-    </span>
-    ${online ? "Internet available" : "Offline"}
-  `;
-}
-
-window.addEventListener("online", updateNetworkStatus);
-window.addEventListener("offline", updateNetworkStatus);
-updateNetworkStatus();
-
-/* ---------------------------------------------------------
-   AUTHENTICATION
-   --------------------------------------------------------- */
-
-async function startAuthentication() {
-  try {
-    if (!auth.currentUser) {
-      await signInAnonymously(auth);
-    }
-  } catch (error) {
-    console.error("Authentication error:", error);
-    notify(
-      "Authentication failed. Check Firebase Anonymous Authentication settings.",
-      "error"
-    );
-  }
+  const result = await signInAnonymously(auth);
+  return result.user;
 }
 
 onAuthStateChanged(auth, async (user) => {
+  if (!user) return;
+
   state.user = user;
 
-  if (!user) {
-    state.profile = null;
-    showGuestIdentity();
-    return;
-  }
-
   try {
-    await loadUserProfile();
+    await loadOrCreateProfile(user);
+    await startPresence();
+    listenForIncomingRequests();
+
+    setStatus("Connected to DataLite Share.");
+    setText("userId", user.uid);
+
+    if (state.profile) {
+      setText("username", "@" + state.profile.username);
+      setText("userCode", state.profile.userCode);
+    }
+
+    generateUserQR();
   } catch (error) {
-    console.error("Profile loading error:", error);
-    notify("Could not load your DataLite profile.", "error");
+    setStatus("Account setup failed: " + getErrorMessage(error));
   }
 });
 
-/* ---------------------------------------------------------
-   PROFILE
-   --------------------------------------------------------- */
+/* -------------------- USER PROFILE -------------------- */
 
-async function loadUserProfile() {
-  if (!state.user) return;
-
-  const profileRef = doc(
-    db,
-    COLLECTIONS.users,
-    state.user.uid
-  );
-
+async function loadOrCreateProfile(user) {
+  const profileRef = doc(db, USERS, user.uid);
   const snapshot = await getDoc(profileRef);
 
-  if (!snapshot.exists()) {
-    showGuestIdentity();
-    return;
+  if (snapshot.exists()) {
+    state.profile = snapshot.data();
+    return state.profile;
   }
 
-  state.profile = snapshot.data();
-  showRegisteredIdentity();
-}
+  const username = "user_" + randomCode(7).toLowerCase();
+  const userCode = randomCode(10);
 
-function showGuestIdentity() {
-  if ($("guestIdentity")) $("guestIdentity").hidden = false;
-  if ($("registeredIdentity")) $("registeredIdentity").hidden = true;
-  safeText($("userStatus"), "Not registered");
-}
+  const usernameRef = doc(db, USERNAMES, username);
 
-function showRegisteredIdentity() {
-  if (!state.profile) return;
-
-  if ($("guestIdentity")) $("guestIdentity").hidden = true;
-  if ($("registeredIdentity")) $("registeredIdentity").hidden = false;
-
-  safeText($("displayUserCode"), state.profile.code);
-  safeText($("displayUsername"), `@${state.profile.username}`);
-  safeText($("userStatus"), "Identity created");
-
-  generateQRCode(state.profile.code);
-}
-
-/* ---------------------------------------------------------
-   CREATE UNIQUE IDENTITY
-   --------------------------------------------------------- */
-
-async function createIdentity(event) {
-  event.preventDefault();
-
-  if (state.busy || !state.user) {
-    notify("Please wait for authentication.", "error");
-    return;
-  }
-
-  const input = $("usernameInput");
-  const username = input?.value.trim().toLowerCase();
-
-  if (!validUsername(username)) {
-    notify(
-      "Use 3–20 characters: letters, numbers or underscores.",
-      "error"
-    );
-    return;
-  }
-
-  const button = $("createIdentityButton");
-
-  try {
-    state.busy = true;
-    setButtonLoading(button, true, "Create ID");
-
-    const usernameRef = doc(
-      db,
-      COLLECTIONS.usernames,
-      username
-    );
-
-    const usernameSnapshot = await getDoc(usernameRef);
-
-    if (usernameSnapshot.exists()) {
-      notify("This username is already taken.", "error");
-      return;
-    }
-
-    const code = createUserCode();
-
-    const profileRef = doc(
-      db,
-      COLLECTIONS.users,
-      state.user.uid
-    );
-
-    const profileSnapshot = await getDoc(profileRef);
-
-    if (profileSnapshot.exists()) {
-      state.profile = profileSnapshot.data();
-      showRegisteredIdentity();
-      notify("Your identity already exists.");
-      return;
-    }
-
-    /*
-      NOTE:
-      This client-side availability check is not an atomic
-      username reservation. Production requires a trusted
-      server-side transaction or a carefully secured
-      Firestore transaction with collision handling.
-    */
-
-    await setDoc(usernameRef, {
-      uid: state.user.uid,
-      username,
-      createdAt: serverTimestamp()
-    });
-
-    await setDoc(profileRef, {
-      uid: state.user.uid,
-      username,
-      code,
-      createdAt: serverTimestamp(),
-      status: "active"
-    });
-
-    state.profile = {
-      uid: state.user.uid,
-      username,
-      code
-    };
-
-    showRegisteredIdentity();
-    notify("Your DataLite identity has been created.");
-
-  } catch (error) {
-    console.error("Identity creation error:", error);
-    notify("Could not create your identity. Try again.", "error");
-  } finally {
-    state.busy = false;
-    setButtonLoading(button, false, "Create ID");
-  }
-}
-
-/* ---------------------------------------------------------
-   QR CODE
-   --------------------------------------------------------- */
-
-function generateQRCode(value) {
-  const wrapper = $("userQrCode");
-  if (!wrapper) return;
-
-  wrapper.replaceChildren();
-
-  if (!window.QRCode) {
-    const script = document.createElement("script");
-    script.src =
-      "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js";
-
-    script.onload = () => generateQRCode(value);
-    script.onerror = () => {
-      wrapper.textContent = "QR unavailable";
-    };
-
-    document.head.appendChild(script);
-    return;
-  }
-
-  new window.QRCode(wrapper, {
-    text: `dataliteshare://user/${encodeURIComponent(value)}`,
-    width: 105,
-    height: 105,
-    colorDark: "#080d19",
-    colorLight: "#ffffff",
-    correctLevel: window.QRCode.CorrectLevel.H
+  await setDoc(usernameRef, {
+    uid: user.uid,
+    createdAt: serverTimestamp()
   });
+
+  const profile = {
+    uid: user.uid,
+    username,
+    userCode,
+    displayName: "DataLite User",
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp()
+  };
+
+  await setDoc(profileRef, profile);
+  state.profile = profile;
+
+  return profile;
 }
 
-async function copyUserCode() {
-  if (!state.profile?.code) return;
-
-  try {
-    await navigator.clipboard.writeText(state.profile.code);
-    notify("DataLite ID copied.");
-  } catch {
-    notify("Clipboard access is unavailable.", "error");
-  }
-}
-
-async function shareQRCode() {
-  if (!state.profile?.code) return;
-
-  const text =
-    `Connect with me on DataLite Share. My ID: ${state.profile.code}`;
-
-  if (navigator.share) {
-    try {
-      await navigator.share({
-        title: "DataLite Share",
-        text
-      });
-    } catch (error) {
-      if (error.name !== "AbortError") {
-        notify("Sharing was not available.", "error");
-      }
-    }
-  } else {
-    try {
-      await navigator.clipboard.writeText(text);
-      notify("Your DataLite ID was copied.");
-    } catch {
-      notify("Unable to share this ID.", "error");
-    }
-  }
-}
-
-/* ---------------------------------------------------------
-   USER SEARCH
-   --------------------------------------------------------- */
-
-async function searchUser(event) {
-  event.preventDefault();
-
+async function changeUsername() {
   if (!state.user) {
-    notify("Authentication is not ready.", "error");
+    notify("Please wait for account setup.");
     return;
   }
 
-  const input = $("searchUserInput");
-  const term = input?.value.trim().toLowerCase();
+  const input =
+    $("newUsername")?.value ||
+    $("usernameInput")?.value;
 
-  if (!term) return;
+  const username = safeUsername(input);
 
-  const results = $("searchResults");
-  if (!results) return;
+  if (username.length < 4) {
+    notify("Username must contain at least 4 characters.");
+    return;
+  }
 
-  results.textContent = "Searching...";
+  const oldUsername = state.profile.username;
+
+  if (username === oldUsername) {
+    notify("This is already your username.");
+    return;
+  }
+
+  const usernameRef = doc(db, USERNAMES, username);
 
   try {
-    let profile = null;
+    const result = await runTransaction(db, async (transaction) => {
+      const existing = await transaction.get(usernameRef);
 
-    if (term.startsWith("dl")) {
-      const codeQuery = query(
-        collection(db, COLLECTIONS.users),
-        where("code", "==", term.toUpperCase()),
-        limit(1)
-      );
-
-      const codeSnapshot = await getDocs(codeQuery);
-
-      if (!codeSnapshot.empty) {
-        profile = codeSnapshot.docs[0].data();
+      if (existing.exists()) {
+        throw new Error("Username is already taken.");
       }
-    } else {
-      const usernameRef = doc(
-        db,
-        COLLECTIONS.usernames,
-        term
-      );
 
-      const usernameSnapshot = await getDoc(usernameRef);
+      transaction.set(usernameRef, {
+        uid: state.user.uid,
+        createdAt: serverTimestamp()
+      });
 
-      if (usernameSnapshot.exists()) {
-        const data = usernameSnapshot.data();
-
-        const profileSnapshot = await getDoc(
-          doc(db, COLLECTIONS.users, data.uid)
-        );
-
-        if (profileSnapshot.exists()) {
-          profile = profileSnapshot.data();
-        }
-      }
-    }
-
-    results.replaceChildren();
-
-    if (!profile || profile.uid === state.user.uid) {
-      results.textContent = profile
-        ? "This is your own account."
-        : "No DataLite user found.";
-      return;
-    }
-
-    const card = document.createElement("div");
-    card.className = "search-user-card";
-
-    const title = document.createElement("strong");
-    title.textContent = `@${profile.username}`;
-
-    const code = document.createElement("p");
-    code.textContent = profile.code;
-
-    const button = document.createElement("button");
-    button.className = "primary-button";
-    button.textContent = "Select Receiver";
-
-    button.addEventListener("click", () => {
-      selectReceiver(profile);
+      transaction.update(doc(db, USERS, state.user.uid), {
+        username,
+        updatedAt: serverTimestamp()
+      });
     });
 
-    card.append(title, code, button);
-    results.appendChild(card);
+    await setDoc(
+      doc(db, USERNAMES, oldUsername),
+      { uid: state.user.uid, retired: true },
+      { merge: true }
+    );
 
+    state.profile.username = username;
+    setText("username", "@" + username);
+    notify("Username updated.");
   } catch (error) {
-    console.error("Search error:", error);
-    results.textContent = "Search failed. Please try again.";
+    notify(getErrorMessage(error));
   }
 }
 
-function selectReceiver(profile) {
-  state.receiver = profile;
+/* -------------------- USER QR -------------------- */
 
-  if ($("receiverCodeInput")) {
-    $("receiverCodeInput").value = profile.code;
+function generateUserQR() {
+  const qrElement =
+    $("userQRCode") ||
+    $("qrCode") ||
+    $("qrContainer");
+
+  if (!qrElement || !state.profile) return;
+
+  qrElement.replaceChildren();
+
+  const identity = state.profile.userCode;
+
+  if (typeof QRCode === "undefined") {
+    qrElement.textContent = identity;
+    return;
   }
 
-  safeText(
-    $("receiverStatus"),
-    `Selected receiver: @${profile.username}`
+  try {
+    new QRCode(qrElement, {
+      text: identity,
+      width: 180,
+      height: 180,
+      correctLevel: QRCode.CorrectLevel.M
+    });
+  } catch (error) {
+    console.error("QR generation failed", error);
+    qrElement.textContent = identity;
+  }
+}
+
+/* -------------------- ONLINE PRESENCE -------------------- */
+
+async function startPresence() {
+  const uid = state.user.uid;
+  const presenceRef = ref(rtdb, `${ROOT}/presence/${uid}`);
+
+  await onDisconnect(presenceRef).remove();
+
+  await set(presenceRef, {
+    uid,
+    username: state.profile.username,
+    userCode: state.profile.userCode,
+    online: true,
+    lastSeen: Date.now()
+  });
+
+  if (state.unsubscribePresence) {
+    state.unsubscribePresence();
+  }
+
+  state.unsubscribePresence = onValue(
+    ref(rtdb, `${ROOT}/presence`),
+    snapshot => {
+      renderPresence(snapshot.val() || {});
+    }
   );
-
-  updateSendButton();
-  notify(`Selected @${profile.username}`);
 }
 
-/* ---------------------------------------------------------
-   FILE SELECTION
-   --------------------------------------------------------- */
+function renderPresence(presence) {
+  const container =
+    $("nearbyUsersList") ||
+    $("onlineUsersList");
 
-function handleFiles(fileList) {
-  state.selectedFiles = Array.from(fileList || []);
-
-  renderSelectedFiles();
-  updateSendButton();
-  updateCompressionEstimate();
-}
-
-function renderSelectedFiles() {
-  const container = $("selectedFiles");
   if (!container) return;
 
   container.replaceChildren();
 
-  if (!state.selectedFiles.length) {
+  const users = Object.values(presence)
+    .filter(item =>
+      item &&
+      item.uid !== state.user?.uid &&
+      item.online === true
+    );
+
+  if (!users.length) {
+    container.textContent = "No other users online.";
     return;
   }
 
-  const totalSize = state.selectedFiles.reduce(
-    (sum, file) => sum + file.size,
-    0
-  );
-
-  const heading = document.createElement("p");
-  heading.textContent =
-    `${state.selectedFiles.length} file(s) selected • ${formatBytes(totalSize)}`;
-
-  container.appendChild(heading);
-
-  state.selectedFiles.forEach((file) => {
+  users.forEach(user => {
     const row = document.createElement("div");
-    row.className = "selected-file-item";
+    row.className = "user-result";
 
     const name = document.createElement("span");
-    name.textContent = file.name;
+    name.textContent = "@" + (user.username || "user");
 
-    const size = document.createElement("small");
-    size.textContent = formatBytes(file.size);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Connect";
+    button.addEventListener("click", () => {
+      createConnectionRequest(user.uid);
+    });
 
-    row.append(name, size);
+    row.append(name, button);
     container.appendChild(row);
   });
 }
 
-function updateSendButton() {
-  const button = $("sendFilesButton");
-  if (!button) return;
+/* -------------------- GLOBAL USER SEARCH -------------------- */
 
-  button.disabled = !(
-    state.user &&
-    state.profile &&
-    state.receiver &&
-    state.selectedFiles.length > 0
+async function searchUsers() {
+  const input =
+    $("userSearchInput") ||
+    $("searchUserInput");
+
+  const queryText = safeUsername(input?.value);
+
+  const results =
+    $("searchResults") ||
+    $("userSearchResults");
+
+  if (!queryText || !results) return;
+
+  results.textContent = "Searching...";
+
+  try {
+    const usersQuery = query(
+      collection(db, USERS),
+      where("username", ">=", queryText),
+      where("username", "<=", queryText + "\uf8ff"),
+      limit(15)
+    );
+
+    const snapshot = await getDocs(usersQuery);
+    results.replaceChildren();
+
+    if (snapshot.empty) {
+      results.textContent = "No matching users found.";
+      return;
+    }
+
+    snapshot.forEach(item => {
+      const user = item.data();
+
+      if (user.uid === state.user.uid) return;
+
+      const row = document.createElement("div");
+      row.className = "user-result";
+
+      const name = document.createElement("span");
+      name.textContent = "@" + user.username;
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Connect";
+      button.addEventListener("click", () => {
+        createConnectionRequest(user.uid);
+      });
+
+      row.append(name, button);
+      results.appendChild(row);
+    });
+  } catch (error) {
+    results.textContent = getErrorMessage(error);
+  }
+}
+
+/* -------------------- CONNECTION REQUESTS -------------------- */
+
+async function createConnectionRequest(receiverUid) {
+  if (!state.user || receiverUid === state.user.uid) return;
+
+  try {
+    const requestRef = push(ref(rtdb, `${ROOT}/requests`));
+    const requestId = requestRef.key;
+
+    const peer = new RTCPeerConnection(ICE_SERVERS);
+    state.peer = peer;
+    state.activeRequestId = requestId;
+    state.activeRole = "sender";
+
+    const channel = peer.createDataChannel("datalite-file-transfer", {
+      ordered: true
+    });
+
+    setupDataChannel(channel);
+
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+
+    await set(requestRef, {
+      requestId,
+      senderUid: state.user.uid,
+      senderName: state.profile.username,
+      receiverUid,
+      status: "pending",
+      offer: {
+        type: offer.type,
+        sdp: offer.sdp
+      },
+      createdAt: Date.now()
+    });
+
+    listenForSenderAnswer(requestId, peer);
+    listenForIceCandidates(requestId, peer, "receiver");
+
+    peer.onicecandidate = event => {
+      if (event.candidate) {
+        set(
+          ref(
+            rtdb,
+            `${ROOT}/signals/${requestId}/senderCandidates/${push(ref(rtdb, `${ROOT}/signals/${requestId}/senderCandidates`)).key}`
+          ),
+          event.candidate.toJSON()
+        ).catch(console.error);
+      }
+    };
+
+    setStatus("Connection request sent. Waiting for acceptance.");
+  } catch (error) {
+    closePeer();
+    notify("Could not create request: " + getErrorMessage(error));
+  }
+}
+
+function listenForIncomingRequests() {
+  const requestsRef = ref(rtdb, `${ROOT}/requests`);
+
+  if (state.unsubscribeRequests) {
+    state.unsubscribeRequests();
+  }
+
+  state.unsubscribeRequests = onChildAdded(
+    requestsRef,
+    snapshot => {
+      const request = snapshot.val();
+
+      if (!request ||
+          request.receiverUid !== state.user.uid ||
+          request.status !== "pending") {
+        return;
+      }
+
+      state.incomingRequests.set(snapshot.key, request);
+      showIncomingRequest(snapshot.key, request);
+    }
   );
 }
 
-/* ---------------------------------------------------------
-   COMPRESSION ESTIMATE
-   This is an informational estimate only.
-   No file is compressed by this function.
-   --------------------------------------------------------- */
+function showIncomingRequest(requestId, request) {
+  const container =
+    $("incomingRequest") ||
+    $("incomingRequestSection");
 
-function updateCompressionEstimate() {
-  const panel = $("compressionResult");
-  if (!panel) return;
+  if (!container) {
+    notify("Incoming connection request from @" + request.senderName);
+    return;
+  }
+
+  show(container.id, true);
+
+  setText(
+    "incomingRequestText",
+    "@" + (request.senderName || "user") + " wants to connect."
+  );
+
+  const acceptButton = $("acceptRequestButton");
+  const rejectButton = $("rejectRequestButton");
+
+  if (acceptButton) {
+    acceptButton.onclick = () => acceptConnectionRequest(requestId);
+  }
+
+  if (rejectButton) {
+    rejectButton.onclick = () => rejectConnectionRequest(requestId);
+  }
+}
+
+async function acceptConnectionRequest(requestId) {
+  const request = state.incomingRequests.get(requestId);
+  if (!request) return;
+
+  try {
+    const peer = new RTCPeerConnection(ICE_SERVERS);
+
+    state.peer = peer;
+    state.activeRequestId = requestId;
+    state.activeRole = "receiver";
+
+    peer.ondatachannel = event => {
+      setupDataChannel(event.channel);
+    };
+
+    await peer.setRemoteDescription(
+      new RTCSessionDescription(request.offer)
+    );
+
+    const answer = await peer.createAnswer();
+    await peer.setLocalDescription(answer);
+
+    peer.onicecandidate = event => {
+      if (event.candidate) {
+        const candidateRef = push(
+          ref(rtdb, `${ROOT}/signals/${requestId}/receiverCandidates`)
+        );
+
+        set(candidateRef, event.candidate.toJSON())
+          .catch(console.error);
+      }
+    };
+
+    await set(
+      ref(rtdb, `${ROOT}/signals/${requestId}/answer`),
+      {
+        type: answer.type,
+        sdp: answer.sdp
+      }
+    );
+
+    await update(ref(rtdb, `${ROOT}/requests/${requestId}`), {
+      status: "accepted",
+      acceptedAt: Date.now()
+    });
+
+    listenForIceCandidates(requestId, peer, "sender");
+
+    setStatus("Connecting to sender...");
+    show("incomingRequest", false);
+  } catch (error) {
+    notify("Could not accept request: " + getErrorMessage(error));
+  }
+}
+
+async function rejectConnectionRequest(requestId) {
+  try {
+    await update(
+      ref(rtdb, `${ROOT}/requests/${requestId}`),
+      { status: "rejected", rejectedAt: Date.now() }
+    );
+
+    state.incomingRequests.delete(requestId);
+    show("incomingRequest", false);
+    notify("Request rejected.");
+  } catch (error) {
+    notify(getErrorMessage(error));
+  }
+}
+
+function listenForSenderAnswer(requestId, peer) {
+  const answerRef = ref(
+    rtdb,
+    `${ROOT}/signals/${requestId}/answer`
+  );
+
+  let applied = false;
+
+  onValue(answerRef, async snapshot => {
+    const answer = snapshot.val();
+
+    if (!answer || applied || peer.signalingState === "closed") {
+      return;
+    }
+
+    applied = true;
+
+    try {
+      await peer.setRemoteDescription(
+        new RTCSessionDescription(answer)
+      );
+      setStatus("Answer received. Establishing connection...");
+    } catch (error) {
+      notify("Answer error: " + getErrorMessage(error));
+    }
+  });
+}
+
+function listenForIceCandidates(requestId, peer, remoteRole) {
+  const path =
+    remoteRole === "sender"
+      ? "senderCandidates"
+      : "receiverCandidates";
+
+  const candidatesRef = ref(
+    rtdb,
+    `${ROOT}/signals/${requestId}/${path}`
+  );
+
+  const pending = [];
+
+  const applyCandidate = async candidate => {
+    try {
+      if (!peer.remoteDescription) {
+        pending.push(candidate);
+        return;
+      }
+
+      await peer.addIceCandidate(
+        new RTCIceCandidate(candidate)
+      );
+    } catch (error) {
+      console.warn("ICE candidate error", error);
+    }
+  };
+
+  onChildAdded(candidatesRef, snapshot => {
+    const candidate = snapshot.val();
+    if (candidate) applyCandidate(candidate);
+  });
+
+  peer.addEventListener("signalingstatechange", async () => {
+    if (!peer.remoteDescription) return;
+
+    while (pending.length) {
+      const candidate = pending.shift();
+
+      try {
+        await peer.addIceCandidate(
+          new RTCIceCandidate(candidate)
+        );
+      } catch (error) {
+        console.warn(error);
+      }
+    }
+  });
+}
+
+/* -------------------- FILE SELECTION -------------------- */
+
+function handleFileSelection(event) {
+  const files = Array.from(event.target.files || []);
+
+  state.selectedFiles = files;
+
+  const list =
+    $("selectedFilesList") ||
+    $("fileList");
+
+  if (!list) return;
+
+  list.replaceChildren();
+
+  files.forEach(file => {
+    const item = document.createElement("div");
+    item.textContent =
+      `${file.name} — ${formatBytes(file.size)}`;
+
+    list.appendChild(item);
+  });
+
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+
+  setText("selectedFileCount", files.length);
+  setText("selectedFileSize", formatBytes(total));
+
+  notify(files.length + " file(s) selected.");
+}
+
+/* -------------------- DATA CHANNEL -------------------- */
+
+function setupDataChannel(channel) {
+  state.channel = channel;
+  channel.binaryType = "arraybuffer";
+
+  channel.onopen = () => {
+    setStatus("Peer connected. Ready to transfer.");
+    show("transferDashboard", true);
+  };
+
+  channel.onclose = () => {
+    setStatus("Peer connection closed.");
+  };
+
+  channel.onerror = error => {
+    console.error("Data channel error", error);
+    notify("Transfer connection error.");
+  };
+
+  channel.onmessage = event => {
+    handleIncomingMessage(event.data);
+  };
+}
+
+function handleIncomingMessage(data) {
+  if (typeof data === "string") {
+    let message;
+
+    try {
+      message = JSON.parse(data);
+    } catch (_) {
+      return;
+    }
+
+    if (message.type === "file-start") {
+      state.receivedChunks = [];
+      state.receivedBytes = 0;
+      state.expectedBytes = Number(message.size) || 0;
+      state.currentFile = {
+        name: String(message.name || "received-file")
+          .replace(/[\\/:*?"<>|]/g, "_"),
+        type: String(message.mime || "application/octet-stream")
+      };
+
+      setText("transferStatus", "Receiving " + state.currentFile.name);
+      setText("transferProgress", "0%");
+      return;
+    }
+
+    if (message.type === "file-end") {
+      finishReceivingFile();
+      return;
+    }
+
+    if (message.type === "cancel") {
+      state.receivedChunks = [];
+      state.receivedBytes = 0;
+      notify("Sender cancelled the transfer.");
+      return;
+    }
+
+    if (message.type === "ping") {
+      state.channel?.send(JSON.stringify({
+        type: "pong",
+        time: message.time
+      }));
+    }
+
+    return;
+  }
+
+  if (data instanceof ArrayBuffer) {
+    state.receivedChunks.push(data);
+    state.receivedBytes += data.byteLength;
+
+    const percent = state.expectedBytes
+      ? Math.min(
+          100,
+          (state.receivedBytes / state.expectedBytes) * 100
+        )
+      : 0;
+
+    updateProgress(percent, state.receivedBytes, state.expectedBytes);
+  }
+}
+
+function finishReceivingFile() {
+  if (!state.currentFile) return;
+
+  const blob = new Blob(state.receivedChunks, {
+    type: state.currentFile.type
+  });
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = state.currentFile.name;
+  link.style.display = "none";
+
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+  state.receivedChunks = [];
+  state.receivedBytes = 0;
+  state.expectedBytes = 0;
+  state.currentFile = null;
+
+  notify("File received. Download started.");
+}
+
+/* -------------------- SENDING FILES -------------------- */
+
+async function waitForBuffer(channel) {
+  while (
+    channel.readyState === "open" &&
+    channel.bufferedAmount > MAX_BUFFERED_AMOUNT
+  ) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+
+  if (channel.readyState !== "open") {
+    throw new Error("Connection closed during transfer.");
+  }
+}
+
+async function sendSelectedFiles() {
+  const channel = state.channel;
+
+  if (!channel || channel.readyState !== "open") {
+    notify("Connect to another user first.");
+    return;
+  }
+
+  if (!state.selectedFiles.length) {
+    notify("Select at least one file.");
+    return;
+  }
 
   const total = state.selectedFiles.reduce(
     (sum, file) => sum + file.size,
     0
   );
 
-  if (!total) {
-    panel.hidden = true;
-    return;
-  }
+  state.totalBytes = total;
+  state.sentBytes = 0;
+  state.cancelled = false;
+  state.sending = true;
+  state.transferStartedAt = Date.now();
 
-  panel.hidden = false;
-
-  safeText($("originalFileSize"), formatBytes(total));
-
-  const mode = document.querySelector(
-    'input[name="compressionMode"]:checked'
-  )?.value || "original";
-
-  let message;
-
-  if (mode === "original") {
-    message = "Same as original";
-  } else {
-    message =
-      "Not calculated — actual compression is not implemented";
-  }
-
-  safeText($("estimatedFileSize"), message);
-}
-
-/* ---------------------------------------------------------
-   FILE DROP AREA
-   --------------------------------------------------------- */
-
-function setupFileDrop() {
-  const area = $("fileDropArea");
-  if (!area) return;
-
-  area.addEventListener("dragover", (event) => {
-    event.preventDefault();
-    area.classList.add("drag-over");
-  });
-
-  area.addEventListener("dragleave", () => {
-    area.classList.remove("drag-over");
-  });
-
-  area.addEventListener("drop", (event) => {
-    event.preventDefault();
-    area.classList.remove("drag-over");
-
-    handleFiles(event.dataTransfer.files);
-  });
-}
-
-/* ---------------------------------------------------------
-   TRANSFER STATUS
-   --------------------------------------------------------- */
-
-function showTransferUnavailable() {
-  notify(
-    "Live transfer is not enabled yet. WebRTC signaling, secure session handling and transfer streaming must be completed first.",
-    "error"
-  );
-}
-
-function pauseTransferUnavailable() {
-  notify(
-    "Pause is not available until the transfer protocol is implemented.",
-    "error"
-  );
-}
-
-function resumeTransferUnavailable() {
-  notify(
-    "Resume is not available until the transfer protocol is implemented.",
-    "error"
-  );
-}
-
-function cancelTransferUnavailable() {
-  notify(
-    "There is no active transfer to cancel.",
-    "error"
-  );
-}
-
-/* ---------------------------------------------------------
-   OFFLINE MODE
-   --------------------------------------------------------- */
-
-function startNearbyMode() {
-  const area = $("nearbyDevices");
-  if (area) {
-    area.hidden = false;
-    area.textContent =
-      "Nearby browser-to-browser discovery is not available in this web version. Native Android local-network support is required for reliable offline discovery.";
-  }
-
-  notify(
-    "Offline transfer needs a supported local wireless transport.",
-    "error"
-  );
-}
-
-/* ---------------------------------------------------------
-   GLOBAL MODE
-   --------------------------------------------------------- */
-
-function startGlobalMode() {
-  $("userSearchSection")?.scrollIntoView({
-    behavior: "smooth",
-    block: "start"
-  });
-
-  notify(
-    "Find the receiver by DataLite ID. Live transfer is not enabled yet."
-  );
-}
-
-/* ---------------------------------------------------------
-   QR SCANNER
-   --------------------------------------------------------- */
-
-async function startQrScanner() {
-  const scanner = $("qrScanner");
-  const video = $("cameraPreview");
-
-  if (!scanner || !video) return;
-
-  if (!navigator.mediaDevices?.getUserMedia) {
-    notify("Camera access requires HTTPS and browser support.", "error");
+  if (total > MAX_IN_MEMORY_FILE_SIZE) {
+    notify(
+      "This first version is limited to files up to 100 MB. " +
+      "Large-file disk streaming is not implemented yet."
+    );
+    state.sending = false;
     return;
   }
 
   try {
-    state.cameraStream =
-      await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "environment"
-        },
-        audio: false
-      });
+    for (const file of state.selectedFiles) {
+      if (state.cancelled) break;
 
-    video.srcObject = state.cameraStream;
-    video.hidden = false;
-    scanner.hidden = false;
+      channel.send(JSON.stringify({
+        type: "file-start",
+        name: file.name,
+        size: file.size,
+        mime: file.type || "application/octet-stream"
+      }));
 
-    notify(
-      "Camera opened. QR decoding is not yet implemented in this version.",
-      "error"
-    );
+      for (
+        let offset = 0;
+        offset < file.size;
+        offset += CHUNK_SIZE
+      ) {
+        if (state.cancelled) break;
 
+        await waitForBuffer(channel);
+
+        const chunk = file.slice(
+          offset,
+          Math.min(offset + CHUNK_SIZE, file.size)
+        );
+
+        const buffer = await chunk.arrayBuffer();
+
+        channel.send(buffer);
+        state.sentBytes += buffer.byteLength;
+
+        const percent = total
+          ? (state.sentBytes / total) * 100
+          : 100;
+
+        updateProgress(percent, state.sentBytes, total);
+      }
+
+      if (!state.cancelled) {
+        channel.send(JSON.stringify({ type: "file-end" }));
+      }
+    }
+
+    if (state.cancelled) {
+      channel.send(JSON.stringify({ type: "cancel" }));
+      notify("Transfer cancelled.");
+    } else {
+      notify("All selected files sent.");
+      saveTransferHistory("sent", total);
+    }
   } catch (error) {
-    console.error("Camera error:", error);
-    notify("Camera permission denied or unavailable.", "error");
+    notify("Transfer failed: " + getErrorMessage(error));
+  } finally {
+    state.sending = false;
   }
 }
 
-function stopCamera() {
-  if (state.cameraStream) {
-    state.cameraStream.getTracks().forEach((track) => {
-      track.stop();
-    });
+function updateProgress(percent, transferred, total) {
+  const safePercent = Math.max(0, Math.min(100, percent));
+
+  const bar =
+    $("transferProgressBar") ||
+    $("progressBar");
+
+  if (bar) {
+    if ("value" in bar) {
+      bar.value = safePercent;
+    } else {
+      bar.style.width = safePercent + "%";
+    }
   }
 
-  state.cameraStream = null;
+  setText("transferProgress", safePercent.toFixed(1) + "%");
+  setText(
+    "transferBytes",
+    formatBytes(transferred) + " / " + formatBytes(total)
+  );
 
-  if ($("cameraPreview")) {
-    $("cameraPreview").srcObject = null;
-    $("cameraPreview").hidden = true;
+  const elapsed = Math.max(
+    1,
+    (Date.now() - state.transferStartedAt) / 1000
+  );
+
+  const speed = transferred / elapsed;
+
+  setText("transferSpeed", formatBytes(speed) + "/s");
+}
+
+/* -------------------- CANCEL -------------------- */
+
+function cancelTransfer() {
+  state.cancelled = true;
+
+  if (state.channel?.readyState === "open") {
+    try {
+      state.channel.send(JSON.stringify({ type: "cancel" }));
+    } catch (_) {}
   }
 
-  if ($("qrScanner")) {
-    $("qrScanner").hidden = true;
-  }
+  setStatus("Cancelling transfer...");
 }
 
-/* ---------------------------------------------------------
-   SHARE LINKS
-   --------------------------------------------------------- */
+/* -------------------- TRANSFER HISTORY -------------------- */
 
-async function createShareLink() {
-  notify(
-    "Live share links require a working WebRTC session and secure token validation. This feature is not enabled yet.",
-    "error"
-  );
-}
+async function saveTransferHistory(direction, bytes) {
+  if (!state.user) return;
 
-function revokeShareLink() {
-  notify(
-    "No active share link is available to revoke.",
-    "error"
-  );
-}
-
-/* ---------------------------------------------------------
-   HISTORY
-   --------------------------------------------------------- */
-
-function clearHistory() {
-  const container = $("transferHistory");
-  if (!container) return;
-
-  container.textContent =
-    "No completed transfers are recorded.";
-
-  notify("Visible history cleared.");
-}
-
-/* ---------------------------------------------------------
-   MENU
-   --------------------------------------------------------- */
-
-function toggleMenu() {
-  const panel = $("menuPanel");
-  if (!panel) return;
-
-  panel.hidden = !panel.hidden;
-}
-
-function closeMenu() {
-  if ($("menuPanel")) {
-    $("menuPanel").hidden = true;
-  }
-}
-
-/* ---------------------------------------------------------
-   BUTTON EVENTS
-   --------------------------------------------------------- */
-
-function bindEvents() {
-  $("createIdentityForm")?.addEventListener(
-    "submit",
-    createIdentity
-  );
-
-  $("userSearchForm")?.addEventListener(
-    "submit",
-    searchUser
-  );
-
-  $("fileInput")?.addEventListener("change", (event) => {
-    handleFiles(event.target.files);
-  });
-
-  $("copyUserCodeButton")?.addEventListener(
-    "click",
-    copyUserCode
-  );
-
-  $("shareQrButton")?.addEventListener(
-    "click",
-    shareQRCode
-  );
-
-  $("nearbyShareButton")?.addEventListener(
-    "click",
-    startNearbyMode
-  );
-
-  $("globalShareButton")?.addEventListener(
-    "click",
-    startGlobalMode
-  );
-
-  $("scanQrButton")?.addEventListener(
-    "click",
-    startQrScanner
-  );
-
-  $("sendFilesButton")?.addEventListener(
-    "click",
-    showTransferUnavailable
-  );
-
-  $("pauseTransferButton")?.addEventListener(
-    "click",
-    pauseTransferUnavailable
-  );
-
-  $("resumeTransferButton")?.addEventListener(
-    "click",
-    resumeTransferUnavailable
-  );
-
-  $("cancelTransferButton")?.addEventListener(
-    "click",
-    cancelTransferUnavailable
-  );
-
-  $("clearHistoryButton")?.addEventListener(
-    "click",
-    clearHistory
-  );
-
-  $("menuButton")?.addEventListener(
-    "click",
-    toggleMenu
-  );
-
-  $("historyMenuButton")?.addEventListener("click", () => {
-    closeMenu();
-    $("historySection")?.scrollIntoView({
-      behavior: "smooth"
-    });
-  });
-
-  $("profileMenuButton")?.addEventListener("click", () => {
-    closeMenu();
-    $("identitySection")?.scrollIntoView({
-      behavior: "smooth"
-    });
-  });
-
-  $("settingsMenuButton")?.addEventListener("click", () => {
-    closeMenu();
-    $("transferSection")?.scrollIntoView({
-      behavior: "smooth"
-    });
-  });
-
-  $("logoutButton")?.addEventListener("click", () => {
-    notify(
-      "Anonymous identity sign-out is not enabled in this version.",
-      "error"
+  try {
+    const historyRef = push(
+      ref(rtdb, `${ROOT}/history/${state.user.uid}`)
     );
-    closeMenu();
-  });
 
-  $("copyShareLinkButton")?.addEventListener(
-    "click",
-    async () => {
-      const value = $("shareLinkOutput")?.value;
+    await set(historyRef, {
+      direction,
+      bytes,
+      createdAt: Date.now()
+    });
+  } catch (error) {
+    console.warn("History could not be saved:", error);
+  }
+}
 
-      if (!value) return;
+async function loadTransferHistory() {
+  if (!state.user) return;
+
+  try {
+    const snapshot = await get(
+      ref(rtdb, `${ROOT}/history/${state.user.uid}`)
+    );
+
+    const container =
+      $("transferHistory") ||
+      $("historyList");
+
+    if (!container) return;
+
+    container.replaceChildren();
+
+    if (!snapshot.exists()) {
+      container.textContent = "No transfer history yet.";
+      return;
+    }
+
+    const history = Object.values(snapshot.val())
+      .sort((a, b) => b.createdAt - a.createdAt);
+
+    history.forEach(item => {
+      const row = document.createElement("div");
+      row.textContent =
+        `${item.direction} · ${formatBytes(item.bytes)} · ` +
+        new Date(item.createdAt).toLocaleString();
+
+      container.appendChild(row);
+    });
+  } catch (error) {
+    notify("Could not load history: " + getErrorMessage(error));
+  }
+}
+
+/* -------------------- DISCONNECT -------------------- */
+
+async function closePeer() {
+  try {
+    if (state.channel) {
+      state.channel.close();
+    }
+
+    if (state.peer) {
+      state.peer.close();
+    }
+  } catch (_) {}
+
+  state.channel = null;
+  state.peer = null;
+  state.activeRequestId = null;
+  state.activeRole = null;
+  state.sending = false;
+}
+
+async function disconnectPeer() {
+  const requestId = state.activeRequestId;
+
+  await closePeer();
+
+  if (requestId) {
+    try {
+      await update(
+        ref(rtdb, `${ROOT}/requests/${requestId}`),
+        { status: "closed", closedAt: Date.now() }
+      );
+    } catch (_) {}
+  }
+
+  setStatus("Disconnected.");
+}
+
+/* -------------------- LOGOUT -------------------- */
+
+async function logout() {
+  try {
+    await closePeer();
+
+    if (state.unsubscribePresence) {
+      state.unsubscribePresence();
+    }
+
+    if (state.unsubscribeRequests) {
+      state.unsubscribeRequests();
+    }
+
+    await signOut(auth);
+    notify("Logged out.");
+  } catch (error) {
+    notify(getErrorMessage(error));
+  }
+}
+
+/* -------------------- CAMERA QR SCANNER -------------------- */
+
+let cameraStream = null;
+let scanTimer = null;
+
+async function startQRScanner() {
+  const video = $("cameraPreview");
+
+  if (!video) {
+    notify("Camera preview element not found.");
+    return;
+  }
+
+  if (!("BarcodeDetector" in window)) {
+    notify(
+      "QR scanning is not supported by this browser. " +
+      "Use your phone camera to scan the QR code."
+    );
+    return;
+  }
+
+  try {
+    const detector = new BarcodeDetector({
+      formats: ["qr_code"]
+    });
+
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+      audio: false
+    });
+
+    video.srcObject = cameraStream;
+    await video.play();
+
+    show("cameraPreview", true);
+
+    scanTimer = setInterval(async () => {
+      if (video.readyState < 2) return;
 
       try {
-        await navigator.clipboard.writeText(value);
-        notify("Share link copied.");
-      } catch {
-        notify("Unable to copy the link.", "error");
+        const codes = await detector.detect(video);
+
+        if (codes.length) {
+          const value = codes[0].rawValue;
+          setValue("userSearchInput", value);
+          stopQRScanner();
+          notify("QR code detected: " + value);
+        }
+      } catch (error) {
+        console.warn(error);
+      }
+    }, 700);
+  } catch (error) {
+    notify("Camera error: " + getErrorMessage(error));
+  }
+}
+
+function stopQRScanner() {
+  if (scanTimer) clearInterval(scanTimer);
+  scanTimer = null;
+
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(track => track.stop());
+  }
+
+  cameraStream = null;
+
+  const video = $("cameraPreview");
+  if (video) video.srcObject = null;
+}
+
+/* -------------------- BUTTON BINDINGS -------------------- */
+
+function bind(id, event, handler) {
+  const element = $(id);
+  if (element) {
+    element.addEventListener(event, handler);
+  }
+}
+
+function bindFirst(ids, event, handler) {
+  for (const id of ids) {
+    const element = $(id);
+
+    if (element) {
+      element.addEventListener(event, handler);
+      return;
+    }
+  }
+}
+
+function setupUI() {
+  bindFirst(
+    ["fileInput", "fileUploadInput", "selectFiles"],
+    "change",
+    handleFileSelection
+  );
+
+  bindFirst(
+    ["sendFileButton", "sendButton", "startTransferButton"],
+    "click",
+    sendSelectedFiles
+  );
+
+  bindFirst(
+    ["cancelTransferButton", "cancelButton"],
+    "click",
+    cancelTransfer
+  );
+
+  bindFirst(
+    ["searchUserButton", "searchButton"],
+    "click",
+    searchUsers
+  );
+
+  bindFirst(
+    ["updateUsernameButton", "saveUsernameButton"],
+    "click",
+    changeUsername
+  );
+
+  bindFirst(
+    ["disconnectButton", "endConnectionButton"],
+    "click",
+    disconnectPeer
+  );
+
+  bindFirst(
+    ["logoutButton", "signOutButton"],
+    "click",
+    logout
+  );
+
+  bindFirst(
+    ["scanQRButton", "startScanButton"],
+    "click",
+    startQRScanner
+  );
+
+  bindFirst(
+    ["stopScanButton"],
+    "click",
+    stopQRScanner
+  );
+
+  bindFirst(
+    ["historyButton", "viewHistoryButton"],
+    "click",
+    loadTransferHistory
+  );
+
+  bindFirst(
+    ["globalShareButton"],
+    "click",
+    () => {
+      const searchInput = $("userSearchInput");
+      if (searchInput?.value) {
+        searchUsers();
+      } else {
+        notify("Enter a username to find someone.");
       }
     }
   );
 
-  $("revokeShareLinkButton")?.addEventListener(
+  bindFirst(
+    ["nearbyShareButton", "nearbyButton"],
     "click",
-    revokeShareLink
-  );
-
-  document.querySelectorAll(
-    'input[name="compressionMode"]'
-  ).forEach((input) => {
-    input.addEventListener(
-      "change",
-      updateCompressionEstimate
-    );
-  });
-
-  document.addEventListener("click", (event) => {
-    const menu = $("menuPanel");
-    const button = $("menuButton");
-
-    if (
-      menu &&
-      !menu.hidden &&
-      !menu.contains(event.target) &&
-      !button?.contains(event.target)
-    ) {
-      closeMenu();
+    () => {
+      notify(
+        "Browser-based nearby Wi-Fi Direct is not available. " +
+        "This feature needs a native Android implementation."
+      );
     }
-  });
-}
-
-/* ---------------------------------------------------------
-   INITIALIZE
-   --------------------------------------------------------- */
-
-function initializeAppUI() {
-  safeText(
-    $("currentYear"),
-    String(new Date().getFullYear())
   );
 
-  bindEvents();
-  setupFileDrop();
-  updateNetworkStatus();
-  updateSendButton();
+  bindFirst(
+    ["compressionSelect", "compressionMode"],
+    "change",
+    () => {
+      notify(
+        "Compression engine is not included in this version. " +
+        "Files are sent unchanged."
+      );
+    }
+  );
 
-  startAuthentication();
+  bind("userSearchInput", "keydown", event => {
+    if (event.key === "Enter") searchUsers();
+  });
 
-  console.info("DataLite Share foundation initialized.");
+  bind("searchUserInput", "keydown", event => {
+    if (event.key === "Enter") searchUsers();
+  });
+
+  if ("Notification" in window &&
+      Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
 }
 
-initializeAppUI();
+/* -------------------- START APPLICATION -------------------- */
+
+async function startApp() {
+  setupUI();
+
+  if (!navigator.onLine) {
+    setStatus("Internet connection required for global sharing.");
+  }
+
+  if (!window.isSecureContext) {
+    console.warn(
+      "DataLite Share requires HTTPS for camera and WebRTC features."
+    );
+  }
+
+  if ("serviceWorker" in navigator) {
+    try {
+      await navigator.serviceWorker.register("./service-worker.js");
+    } catch (error) {
+      console.warn("Service worker registration failed:", error);
+    }
+  }
+
+  try {
+    await authenticate();
+  } catch (error) {
+    setStatus("Firebase login failed: " + getErrorMessage(error));
+  }
+}
+
+window.addEventListener("online", () => {
+  setStatus("Internet connection restored.");
+});
+
+window.addEventListener("offline", () => {
+  setStatus("Internet connection lost.");
+});
+
+window.addEventListener("beforeunload", () => {
+  stopQRScanner();
+  closePeer();
+});
+
+startApp();
