@@ -1,19 +1,10 @@
-/*
- * DataLite Share
- * Firebase project: celebration-of-life-d3dfa
- * Version: 1.0.0 - P2P foundation
- *
- * Uses separate DataLite paths and collections.
- * No Cloud Storage is used for file transfer.
- *
- * Current transfer mode:
- * WebRTC DataChannel + in-memory receiver buffer.
- * Not suitable for very large files yet.
- */
+/* =========================================================
+   DataLite Share — script.js
+   Firebase: celebration-of-life-d3dfa
+   Browser P2P foundation
+   ========================================================= */
 
-import { initializeApp } from
-  "https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js";
-
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js";
 import {
   getAuth,
   signInAnonymously,
@@ -26,13 +17,13 @@ import {
   doc,
   getDoc,
   setDoc,
+  runTransaction,
   collection,
   query,
   where,
   limit,
   getDocs,
-  serverTimestamp,
-  updateDoc
+  serverTimestamp
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 
 import {
@@ -42,14 +33,13 @@ import {
   get,
   update,
   remove,
-  onValue,
-  onChildAdded,
-  onDisconnect,
   push,
-  runTransaction
+  onDisconnect,
+  onValue,
+  onChildAdded
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-database.js";
 
-/* -------------------- CONFIGURATION -------------------- */
+/* ---------------- FIREBASE ---------------- */
 
 const firebaseConfig = {
   apiKey: "AIzaSyCm2ZwhbLg6SSY2qwAiOdMDx1i8sJjIQ",
@@ -72,429 +62,475 @@ const USERS = "dataliteShareUsers";
 const USERNAMES = "dataliteShareUsernames";
 const ROOT = "dataliteShare";
 
+const MAX_FILE_SIZE = 100 * 1024 * 1024;
 const CHUNK_SIZE = 16 * 1024;
-const MAX_BUFFERED_AMOUNT = 1024 * 1024;
-const MAX_IN_MEMORY_FILE_SIZE = 100 * 1024 * 1024;
+const BUFFER_LIMIT = 1024 * 1024;
 
-const ICE_SERVERS = {
+const ICE_CONFIG = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" }
   ]
 };
 
-/* -------------------- STATE -------------------- */
+/* ---------------- APP STATE ---------------- */
 
 const state = {
   user: null,
   profile: null,
   peer: null,
   channel: null,
-  activeRequestId: null,
-  activeRole: null,
+  requestId: null,
+  role: null,
   selectedFiles: [],
+  targetUser: null,
+  incoming: null,
+  sending: false,
+  paused: false,
+  cancelled: false,
   receivedChunks: [],
   receivedBytes: 0,
   expectedBytes: 0,
   currentFile: null,
-  sending: false,
-  cancelled: false,
-  incomingRequests: new Map(),
-  unsubscribePresence: null,
-  unsubscribeRequests: null,
-  unsubscribeSignals: null,
-  transferStartedAt: 0,
-  sentBytes: 0,
-  totalBytes: 0
+  totalBytes: 0,
+  transferredBytes: 0,
+  startedAt: 0,
+  presenceUnsubscribe: null,
+  requestUnsubscribe: null,
+  candidateUnsubscribers: []
 };
 
-/* -------------------- DOM HELPERS -------------------- */
+/* ---------------- HELPERS ---------------- */
 
-const $ = (id) => document.getElementById(id);
+const $ = id => document.getElementById(id);
 
-function setText(id, value) {
-  const el = $(id);
-  if (el) el.textContent = String(value);
+function text(id, value) {
+  const element = $(id);
+  if (element) element.textContent = String(value);
 }
 
-function setValue(id, value) {
-  const el = $(id);
-  if (el) el.value = value;
+function visible(id, show) {
+  const element = $(id);
+  if (element) element.hidden = !show;
 }
 
-function show(id, visible = true) {
-  const el = $(id);
-  if (el) el.hidden = !visible;
-}
+function notify(message) {
+  const area = $("notificationArea");
 
-function setStatus(message) {
-  const ids = [
-    "statusMessage",
-    "connectionStatus",
-    "transferStatus"
-  ];
+  if (area) {
+    area.textContent = message;
+    area.classList.add("show");
 
-  ids.forEach(id => {
-    if ($(id)) setText(id, message);
-  });
+    clearTimeout(notify.timer);
+    notify.timer = setTimeout(() => {
+      area.classList.remove("show");
+    }, 4000);
+  }
 
   console.info("[DataLite]", message);
 }
 
-function notify(message) {
-  setStatus(message);
-  if ("Notification" in window &&
-      Notification.permission === "granted") {
-    try {
-      new Notification("DataLite Share", { body: message });
-    } catch (_) {}
-  }
+function status(message) {
+  text("networkStatus", message);
 }
 
-function formatBytes(bytes) {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-
+function bytes(value) {
+  if (!value) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const index = Math.min(
-    Math.floor(Math.log(bytes) / Math.log(1024)),
+    Math.floor(Math.log(value) / Math.log(1024)),
     units.length - 1
   );
-
-  return (
-    (bytes / Math.pow(1024, index)).toFixed(2) +
-    " " +
-    units[index]
-  );
+  return `${(value / Math.pow(1024, index)).toFixed(2)} ${units[index]}`;
 }
 
-function safeUsername(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, "")
-    .slice(0, 20);
+function randomCode(length = 10) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const random = crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(random, value =>
+    alphabet[value % alphabet.length]
+  ).join("");
 }
 
-function randomCode(length = 8) {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const bytes = crypto.getRandomValues(new Uint8Array(length));
-
-  return Array.from(bytes)
-    .map(byte => chars[byte % chars.length])
-    .join("");
+function cleanUsername(value) {
+  return String(value || "").trim().toLowerCase();
 }
 
-function getErrorMessage(error) {
+function validUsername(value) {
+  return /^[a-z0-9_]{3,20}$/.test(value);
+}
+
+function showError(error) {
   console.error(error);
-  return error?.message || "Something went wrong.";
+  notify(error?.message || "Something went wrong.");
 }
 
-/* -------------------- AUTHENTICATION -------------------- */
-
-async function authenticate() {
-  if (auth.currentUser) return auth.currentUser;
-
-  const result = await signInAnonymously(auth);
-  return result.user;
+function scrollTo(id) {
+  $(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-onAuthStateChanged(auth, async (user) => {
-  if (!user) return;
+/* ---------------- AUTH AND PROFILE ---------------- */
 
-  state.user = user;
-
+async function initializeAccount() {
   try {
-    await loadOrCreateProfile(user);
-    await startPresence();
-    listenForIncomingRequests();
+    status("Connecting to Firebase...");
 
-    setStatus("Connected to DataLite Share.");
-    setText("userId", user.uid);
-
-    if (state.profile) {
-      setText("username", "@" + state.profile.username);
-      setText("userCode", state.profile.userCode);
+    if (!auth.currentUser) {
+      await signInAnonymously(auth);
     }
 
-    generateUserQR();
+    state.user = auth.currentUser;
+
+    if (!state.user) throw new Error("Firebase login failed.");
+
+    const profileRef = doc(db, USERS, state.user.uid);
+    const profileSnap = await getDoc(profileRef);
+
+    if (profileSnap.exists()) {
+      state.profile = profileSnap.data();
+      displayRegisteredIdentity();
+      await startPresence();
+      loadHistory();
+      status("Online");
+      text("userStatus", "Online");
+    } else {
+      visible("guestIdentity", true);
+      visible("registeredIdentity", false);
+      text("userStatus", "Create ID");
+      status("Create your DataLite ID");
+    }
+
+    listenForIncomingRequests();
   } catch (error) {
-    setStatus("Account setup failed: " + getErrorMessage(error));
+    status("Connection error");
+    showError(error);
   }
-});
-
-/* -------------------- USER PROFILE -------------------- */
-
-async function loadOrCreateProfile(user) {
-  const profileRef = doc(db, USERS, user.uid);
-  const snapshot = await getDoc(profileRef);
-
-  if (snapshot.exists()) {
-    state.profile = snapshot.data();
-    return state.profile;
-  }
-
-  const username = "user_" + randomCode(7).toLowerCase();
-  const userCode = randomCode(10);
-
-  const usernameRef = doc(db, USERNAMES, username);
-
-  await setDoc(usernameRef, {
-    uid: user.uid,
-    createdAt: serverTimestamp()
-  });
-
-  const profile = {
-    uid: user.uid,
-    username,
-    userCode,
-    displayName: "DataLite User",
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp()
-  };
-
-  await setDoc(profileRef, profile);
-  state.profile = profile;
-
-  return profile;
 }
 
-async function changeUsername() {
+function displayRegisteredIdentity() {
+  visible("guestIdentity", false);
+  visible("registeredIdentity", true);
+
+  text("displayUserCode", state.profile.userCode);
+  text("displayUsername", "@" + state.profile.username);
+  text("userStatus", "Online");
+
+  createIdentityQR();
+}
+
+async function createIdentity(event) {
+  event.preventDefault();
+
   if (!state.user) {
-    notify("Please wait for account setup.");
+    notify("Please wait for Firebase connection.");
     return;
   }
 
-  const input =
-    $("newUsername")?.value ||
-    $("usernameInput")?.value;
+  const username = cleanUsername($("usernameInput")?.value);
 
-  const username = safeUsername(input);
-
-  if (username.length < 4) {
-    notify("Username must contain at least 4 characters.");
+  if (!validUsername(username)) {
+    notify("Use 3–20 letters, numbers or underscores.");
     return;
   }
 
-  const oldUsername = state.profile.username;
-
-  if (username === oldUsername) {
-    notify("This is already your username.");
-    return;
-  }
-
+  const profileRef = doc(db, USERS, state.user.uid);
   const usernameRef = doc(db, USERNAMES, username);
+  const userCode = randomCode();
 
   try {
-    const result = await runTransaction(db, async (transaction) => {
-      const existing = await transaction.get(usernameRef);
+    await runTransaction(db, async transaction => {
+      const existingProfile = await transaction.get(profileRef);
+      if (existingProfile.exists()) {
+        throw new Error("Your DataLite ID already exists.");
+      }
 
-      if (existing.exists()) {
-        throw new Error("Username is already taken.");
+      const existingUsername = await transaction.get(usernameRef);
+      if (existingUsername.exists()) {
+        throw new Error("This username is already taken.");
       }
 
       transaction.set(usernameRef, {
         uid: state.user.uid,
+        username,
         createdAt: serverTimestamp()
       });
 
-      transaction.update(doc(db, USERS, state.user.uid), {
+      transaction.set(profileRef, {
+        uid: state.user.uid,
         username,
-        updatedAt: serverTimestamp()
+        userCode,
+        createdAt: serverTimestamp()
       });
     });
 
-    await setDoc(
-      doc(db, USERNAMES, oldUsername),
-      { uid: state.user.uid, retired: true },
-      { merge: true }
-    );
+    state.profile = {
+      uid: state.user.uid,
+      username,
+      userCode
+    };
 
-    state.profile.username = username;
-    setText("username", "@" + username);
-    notify("Username updated.");
+    displayRegisteredIdentity();
+    await startPresence();
+
+    notify("Your DataLite ID has been created!");
+    status("Online");
+    text("userStatus", "Online");
   } catch (error) {
-    notify(getErrorMessage(error));
+    showError(error);
   }
 }
 
-/* -------------------- USER QR -------------------- */
+/* ---------------- QR ID DISPLAY ---------------- */
 
-function generateUserQR() {
-  const qrElement =
-    $("userQRCode") ||
-    $("qrCode") ||
-    $("qrContainer");
+function createIdentityQR() {
+  const container = $("userQrCode");
+  if (!container || !state.profile) return;
 
-  if (!qrElement || !state.profile) return;
+  container.replaceChildren();
 
-  qrElement.replaceChildren();
+  const code = document.createElement("strong");
+  code.textContent = state.profile.userCode;
+  code.style.wordBreak = "break-word";
 
-  const identity = state.profile.userCode;
+  const note = document.createElement("small");
+  note.textContent = "Your DataLite ID";
 
-  if (typeof QRCode === "undefined") {
-    qrElement.textContent = identity;
+  container.append(code, note);
+}
+
+async function shareQR() {
+  if (!state.profile) {
+    notify("Create your DataLite ID first.");
     return;
   }
 
+  const shareData = {
+    title: "My DataLite ID",
+    text:
+      `Connect with me on DataLite Share. My ID: ${state.profile.userCode}`
+  };
+
   try {
-    new QRCode(qrElement, {
-      text: identity,
-      width: 180,
-      height: 180,
-      correctLevel: QRCode.CorrectLevel.M
-    });
+    if (navigator.share) {
+      await navigator.share(shareData);
+    } else {
+      await navigator.clipboard.writeText(shareData.text);
+      notify("ID copied. Share it with your contact.");
+    }
   } catch (error) {
-    console.error("QR generation failed", error);
-    qrElement.textContent = identity;
+    if (error.name !== "AbortError") showError(error);
   }
 }
 
-/* -------------------- ONLINE PRESENCE -------------------- */
+async function copyUserCode() {
+  if (!state.profile) return;
+
+  try {
+    await navigator.clipboard.writeText(state.profile.userCode);
+    notify("DataLite ID copied.");
+  } catch (_) {
+    notify("Please copy your ID manually: " + state.profile.userCode);
+  }
+}
+
+/* ---------------- PRESENCE ---------------- */
 
 async function startPresence() {
-  const uid = state.user.uid;
-  const presenceRef = ref(rtdb, `${ROOT}/presence/${uid}`);
+  if (!state.user || !state.profile) return;
+
+  const presenceRef = ref(
+    rtdb,
+    `${ROOT}/presence/${state.user.uid}`
+  );
 
   await onDisconnect(presenceRef).remove();
 
   await set(presenceRef, {
-    uid,
+    uid: state.user.uid,
     username: state.profile.username,
     userCode: state.profile.userCode,
     online: true,
     lastSeen: Date.now()
   });
 
-  if (state.unsubscribePresence) {
-    state.unsubscribePresence();
-  }
+  state.presenceUnsubscribe?.();
 
-  state.unsubscribePresence = onValue(
+  state.presenceUnsubscribe = onValue(
     ref(rtdb, `${ROOT}/presence`),
     snapshot => {
-      renderPresence(snapshot.val() || {});
+      const users = snapshot.val() || {};
+      const onlineCount = Object.values(users).filter(
+        item => item?.online && item.uid !== state.user.uid
+      ).length;
+
+      status(navigator.onLine
+        ? `Online · ${onlineCount} users`
+        : "Offline");
+    },
+    error => {
+      console.error(error);
+      status("Database connection error");
     }
   );
 }
 
-function renderPresence(presence) {
-  const container =
-    $("nearbyUsersList") ||
-    $("onlineUsersList");
+/* ---------------- USER SEARCH ---------------- */
 
-  if (!container) return;
+async function searchUser(event) {
+  event?.preventDefault();
 
-  container.replaceChildren();
-
-  const users = Object.values(presence)
-    .filter(item =>
-      item &&
-      item.uid !== state.user?.uid &&
-      item.online === true
-    );
-
-  if (!users.length) {
-    container.textContent = "No other users online.";
+  if (!state.user) {
+    notify("Wait for account connection.");
     return;
   }
 
-  users.forEach(user => {
-    const row = document.createElement("div");
-    row.className = "user-result";
+  const value = String($("searchUserInput")?.value || "").trim();
 
-    const name = document.createElement("span");
-    name.textContent = "@" + (user.username || "user");
+  if (!value) {
+    notify("Enter a username or DataLite ID.");
+    return;
+  }
 
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Connect";
-    button.addEventListener("click", () => {
-      createConnectionRequest(user.uid);
-    });
-
-    row.append(name, button);
-    container.appendChild(row);
-  });
-}
-
-/* -------------------- GLOBAL USER SEARCH -------------------- */
-
-async function searchUsers() {
-  const input =
-    $("userSearchInput") ||
-    $("searchUserInput");
-
-  const queryText = safeUsername(input?.value);
-
-  const results =
-    $("searchResults") ||
-    $("userSearchResults");
-
-  if (!queryText || !results) return;
-
+  const results = $("searchResults");
+  results.replaceChildren();
   results.textContent = "Searching...";
 
   try {
-    const usersQuery = query(
-      collection(db, USERS),
-      where("username", ">=", queryText),
-      where("username", "<=", queryText + "\uf8ff"),
-      limit(15)
-    );
+    let userData = null;
 
-    const snapshot = await getDocs(usersQuery);
+    if (/^[A-Z0-9]{10}$/.test(value.toUpperCase())) {
+      const q = query(
+        collection(db, USERS),
+        where("userCode", "==", value.toUpperCase()),
+        limit(1)
+      );
+
+      const result = await getDocs(q);
+      if (!result.empty) userData = result.docs[0].data();
+    } else {
+      const username = cleanUsername(value);
+      const usernameSnap = await getDoc(
+        doc(db, USERNAMES, username)
+      );
+
+      if (usernameSnap.exists()) {
+        const uid = usernameSnap.data().uid;
+        const profileSnap = await getDoc(doc(db, USERS, uid));
+        if (profileSnap.exists()) userData = profileSnap.data();
+      }
+    }
+
     results.replaceChildren();
 
-    if (snapshot.empty) {
-      results.textContent = "No matching users found.";
+    if (!userData) {
+      results.textContent = "No DataLite user found.";
       return;
     }
 
-    snapshot.forEach(item => {
-      const user = item.data();
+    if (userData.uid === state.user.uid) {
+      results.textContent = "This is your own DataLite ID.";
+      return;
+    }
 
-      if (user.uid === state.user.uid) return;
+    state.targetUser = userData;
 
-      const row = document.createElement("div");
-      row.className = "user-result";
+    const card = document.createElement("div");
+    card.className = "user-result";
 
-      const name = document.createElement("span");
-      name.textContent = "@" + user.username;
+    const name = document.createElement("strong");
+    name.textContent = "@" + userData.username;
 
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = "Connect";
-      button.addEventListener("click", () => {
-        createConnectionRequest(user.uid);
-      });
+    const code = document.createElement("p");
+    code.textContent = "ID: " + userData.userCode;
 
-      row.append(name, button);
-      results.appendChild(row);
+    const connect = document.createElement("button");
+    connect.type = "button";
+    connect.textContent = "Request Connection";
+    connect.addEventListener("click", () => {
+      $("receiverCodeInput").value = userData.userCode;
+      state.targetUser = userData;
+      text("receiverStatus", "Selected: @" + userData.username);
+      createConnectionRequest(userData);
     });
+
+    card.append(name, code, connect);
+    results.appendChild(card);
   } catch (error) {
-    results.textContent = getErrorMessage(error);
+    results.textContent = error.message || "Search failed.";
+    console.error(error);
   }
 }
 
-/* -------------------- CONNECTION REQUESTS -------------------- */
+/* ---------------- RECEIVER LOOKUP ---------------- */
 
-async function createConnectionRequest(receiverUid) {
-  if (!state.user || receiverUid === state.user.uid) return;
+async function lookupReceiver() {
+  const value = String($("receiverCodeInput")?.value || "")
+    .trim().toUpperCase();
+
+  if (!value) {
+    notify("Enter receiver's unique DataLite ID.");
+    return null;
+  }
+
+  if (!state.user) return null;
 
   try {
+    const q = query(
+      collection(db, USERS),
+      where("userCode", "==", value),
+      limit(1)
+    );
+
+    const result = await getDocs(q);
+
+    if (result.empty) {
+      text("receiverStatus", "No user found with this ID.");
+      state.targetUser = null;
+      return null;
+    }
+
+    const receiver = result.docs[0].data();
+
+    if (receiver.uid === state.user.uid) {
+      text("receiverStatus", "You cannot send files to yourself.");
+      return null;
+    }
+
+    state.targetUser = receiver;
+    text("receiverStatus", "Receiver found: @" + receiver.username);
+
+    return receiver;
+  } catch (error) {
+    showError(error);
+    return null;
+  }
+}
+
+/* ---------------- REQUEST AND WEBRTC ---------------- */
+
+async function createConnectionRequest(receiver) {
+  if (!state.profile) {
+    notify("Create your DataLite ID first.");
+    return;
+  }
+
+  try {
+    await closePeer();
+
     const requestRef = push(ref(rtdb, `${ROOT}/requests`));
     const requestId = requestRef.key;
 
-    const peer = new RTCPeerConnection(ICE_SERVERS);
+    const peer = new RTCPeerConnection(ICE_CONFIG);
     state.peer = peer;
-    state.activeRequestId = requestId;
-    state.activeRole = "sender";
+    state.requestId = requestId;
+    state.role = "sender";
 
-    const channel = peer.createDataChannel("datalite-file-transfer", {
+    const channel = peer.createDataChannel("datalite-transfer", {
       ordered: true
     });
 
     setupDataChannel(channel);
+    setupLocalIce(peer, requestId, "sender");
 
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
@@ -503,7 +539,7 @@ async function createConnectionRequest(receiverUid) {
       requestId,
       senderUid: state.user.uid,
       senderName: state.profile.username,
-      receiverUid,
+      receiverUid: receiver.uid,
       status: "pending",
       offer: {
         type: offer.type,
@@ -512,286 +548,427 @@ async function createConnectionRequest(receiverUid) {
       createdAt: Date.now()
     });
 
-    listenForSenderAnswer(requestId, peer);
-    listenForIceCandidates(requestId, peer, "receiver");
+    listenForAnswer(requestId, peer);
+    listenForRemoteIce(requestId, peer, "receiver");
 
-    peer.onicecandidate = event => {
-      if (event.candidate) {
-        set(
-          ref(
-            rtdb,
-            `${ROOT}/signals/${requestId}/senderCandidates/${push(ref(rtdb, `${ROOT}/signals/${requestId}/senderCandidates`)).key}`
-          ),
-          event.candidate.toJSON()
-        ).catch(console.error);
-      }
-    };
-
-    setStatus("Connection request sent. Waiting for acceptance.");
+    notify("Connection request sent to @" + receiver.username);
+    text("receiverStatus", "Waiting for receiver to accept...");
   } catch (error) {
-    closePeer();
-    notify("Could not create request: " + getErrorMessage(error));
+    await closePeer();
+    showError(error);
   }
 }
 
 function listenForIncomingRequests() {
-  const requestsRef = ref(rtdb, `${ROOT}/requests`);
+  state.requestUnsubscribe?.();
 
-  if (state.unsubscribeRequests) {
-    state.unsubscribeRequests();
-  }
-
-  state.unsubscribeRequests = onChildAdded(
-    requestsRef,
+  state.requestUnsubscribe = onChildAdded(
+    ref(rtdb, `${ROOT}/requests`),
     snapshot => {
       const request = snapshot.val();
 
-      if (!request ||
-          request.receiverUid !== state.user.uid ||
-          request.status !== "pending") {
-        return;
-      }
+      if (
+        !request ||
+        request.receiverUid !== state.user?.uid ||
+        request.status !== "pending"
+      ) return;
 
-      state.incomingRequests.set(snapshot.key, request);
-      showIncomingRequest(snapshot.key, request);
+      state.incoming = {
+        id: snapshot.key,
+        data: request
+      };
+
+      text(
+        "incomingRequestDetails",
+        `@${request.senderName || "DataLite user"} wants to connect.`
+      );
+
+      visible("incomingRequestSection", true);
+      notify("Incoming connection request.");
     }
   );
 }
 
-function showIncomingRequest(requestId, request) {
-  const container =
-    $("incomingRequest") ||
-    $("incomingRequestSection");
+async function acceptIncomingRequest() {
+  if (!state.incoming) return;
 
-  if (!container) {
-    notify("Incoming connection request from @" + request.senderName);
-    return;
-  }
-
-  show(container.id, true);
-
-  setText(
-    "incomingRequestText",
-    "@" + (request.senderName || "user") + " wants to connect."
-  );
-
-  const acceptButton = $("acceptRequestButton");
-  const rejectButton = $("rejectRequestButton");
-
-  if (acceptButton) {
-    acceptButton.onclick = () => acceptConnectionRequest(requestId);
-  }
-
-  if (rejectButton) {
-    rejectButton.onclick = () => rejectConnectionRequest(requestId);
-  }
-}
-
-async function acceptConnectionRequest(requestId) {
-  const request = state.incomingRequests.get(requestId);
-  if (!request) return;
+  const { id, data } = state.incoming;
 
   try {
-    const peer = new RTCPeerConnection(ICE_SERVERS);
+    await closePeer();
 
+    const peer = new RTCPeerConnection(ICE_CONFIG);
     state.peer = peer;
-    state.activeRequestId = requestId;
-    state.activeRole = "receiver";
+    state.requestId = id;
+    state.role = "receiver";
 
     peer.ondatachannel = event => {
       setupDataChannel(event.channel);
     };
 
-    await peer.setRemoteDescription(
-      new RTCSessionDescription(request.offer)
-    );
+    await peer.setRemoteDescription(data.offer);
+    setupLocalIce(peer, id, "receiver");
 
     const answer = await peer.createAnswer();
     await peer.setLocalDescription(answer);
 
-    peer.onicecandidate = event => {
-      if (event.candidate) {
-        const candidateRef = push(
-          ref(rtdb, `${ROOT}/signals/${requestId}/receiverCandidates`)
-        );
-
-        set(candidateRef, event.candidate.toJSON())
-          .catch(console.error);
-      }
-    };
-
     await set(
-      ref(rtdb, `${ROOT}/signals/${requestId}/answer`),
+      ref(rtdb, `${ROOT}/signals/${id}/answer`),
       {
         type: answer.type,
         sdp: answer.sdp
       }
     );
 
-    await update(ref(rtdb, `${ROOT}/requests/${requestId}`), {
+    await update(ref(rtdb, `${ROOT}/requests/${id}`), {
       status: "accepted",
       acceptedAt: Date.now()
     });
 
-    listenForIceCandidates(requestId, peer, "sender");
+    listenForRemoteIce(id, peer, "sender");
 
-    setStatus("Connecting to sender...");
-    show("incomingRequest", false);
+    visible("incomingRequestSection", false);
+    visible("liveTransferSection", true);
+    text("transferStatus", "Connecting");
+
+    notify("Request accepted. Connecting...");
   } catch (error) {
-    notify("Could not accept request: " + getErrorMessage(error));
+    showError(error);
   }
 }
 
-async function rejectConnectionRequest(requestId) {
+async function rejectIncomingRequest() {
+  if (!state.incoming) return;
+
   try {
     await update(
-      ref(rtdb, `${ROOT}/requests/${requestId}`),
+      ref(rtdb, `${ROOT}/requests/${state.incoming.id}`),
       { status: "rejected", rejectedAt: Date.now() }
     );
 
-    state.incomingRequests.delete(requestId);
-    show("incomingRequest", false);
+    state.incoming = null;
+    visible("incomingRequestSection", false);
     notify("Request rejected.");
   } catch (error) {
-    notify(getErrorMessage(error));
+    showError(error);
   }
 }
 
-function listenForSenderAnswer(requestId, peer) {
-  const answerRef = ref(
-    rtdb,
-    `${ROOT}/signals/${requestId}/answer`
-  );
+function setupLocalIce(peer, requestId, role) {
+  peer.onicecandidate = event => {
+    if (!event.candidate) return;
 
-  let applied = false;
+    const candidateRef = push(
+      ref(rtdb, `${ROOT}/signals/${requestId}/${role}Candidates`)
+    );
 
-  onValue(answerRef, async snapshot => {
-    const answer = snapshot.val();
+    set(candidateRef, event.candidate.toJSON())
+      .catch(console.error);
+  };
 
-    if (!answer || applied || peer.signalingState === "closed") {
-      return;
+  peer.onconnectionstatechange = () => {
+    const connectionState = peer.connectionState;
+
+    text("transferStatus", connectionState);
+
+    if (connectionState === "connected") {
+      visible("liveTransferSection", true);
+      notify("Peer connection established.");
     }
 
-    applied = true;
-
-    try {
-      await peer.setRemoteDescription(
-        new RTCSessionDescription(answer)
-      );
-      setStatus("Answer received. Establishing connection...");
-    } catch (error) {
-      notify("Answer error: " + getErrorMessage(error));
+    if (
+      connectionState === "failed" ||
+      connectionState === "disconnected"
+    ) {
+      notify("Connection interrupted. Check both devices' networks.");
     }
-  });
+  };
 }
 
-function listenForIceCandidates(requestId, peer, remoteRole) {
-  const path =
-    remoteRole === "sender"
-      ? "senderCandidates"
-      : "receiverCandidates";
+function listenForAnswer(requestId, peer) {
+  let applied = false;
 
-  const candidatesRef = ref(
-    rtdb,
-    `${ROOT}/signals/${requestId}/${path}`
-  );
+  onValue(
+    ref(rtdb, `${ROOT}/signals/${requestId}/answer`),
+    async snapshot => {
+      const answer = snapshot.val();
 
-  const pending = [];
-
-  const applyCandidate = async candidate => {
-    try {
-      if (!peer.remoteDescription) {
-        pending.push(candidate);
+      if (!answer || applied || peer.signalingState === "closed") {
         return;
       }
 
-      await peer.addIceCandidate(
-        new RTCIceCandidate(candidate)
-      );
+      applied = true;
+
+      try {
+        await peer.setRemoteDescription(answer);
+      } catch (error) {
+        showError(error);
+      }
+    }
+  );
+}
+
+function listenForRemoteIce(requestId, peer, remoteRole) {
+  const candidateRef = ref(
+    rtdb,
+    `${ROOT}/signals/${requestId}/${remoteRole}Candidates`
+  );
+
+  const pending = [];
+  let remoteReady = false;
+
+  const apply = async candidate => {
+    if (!remoteReady || !peer.remoteDescription) {
+      pending.push(candidate);
+      return;
+    }
+
+    try {
+      await peer.addIceCandidate(candidate);
     } catch (error) {
-      console.warn("ICE candidate error", error);
+      console.warn("ICE candidate:", error);
     }
   };
 
-  onChildAdded(candidatesRef, snapshot => {
+  const unsubscribe = onChildAdded(candidateRef, snapshot => {
     const candidate = snapshot.val();
-    if (candidate) applyCandidate(candidate);
+    if (candidate) apply(candidate);
   });
 
-  peer.addEventListener("signalingstatechange", async () => {
-    if (!peer.remoteDescription) return;
+  state.candidateUnsubscribers.push(unsubscribe);
 
-    while (pending.length) {
-      const candidate = pending.shift();
-
-      try {
-        await peer.addIceCandidate(
-          new RTCIceCandidate(candidate)
-        );
-      } catch (error) {
-        console.warn(error);
-      }
+  const check = setInterval(async () => {
+    if (peer.signalingState === "closed") {
+      clearInterval(check);
+      return;
     }
-  });
+
+    if (peer.remoteDescription && !remoteReady) {
+      remoteReady = true;
+
+      while (pending.length) {
+        const candidate = pending.shift();
+        try {
+          await peer.addIceCandidate(candidate);
+        } catch (error) {
+          console.warn(error);
+        }
+      }
+
+      clearInterval(check);
+    }
+  }, 100);
 }
 
-/* -------------------- FILE SELECTION -------------------- */
-
-function handleFileSelection(event) {
-  const files = Array.from(event.target.files || []);
-
-  state.selectedFiles = files;
-
-  const list =
-    $("selectedFilesList") ||
-    $("fileList");
-
-  if (!list) return;
-
-  list.replaceChildren();
-
-  files.forEach(file => {
-    const item = document.createElement("div");
-    item.textContent =
-      `${file.name} — ${formatBytes(file.size)}`;
-
-    list.appendChild(item);
-  });
-
-  const total = files.reduce((sum, file) => sum + file.size, 0);
-
-  setText("selectedFileCount", files.length);
-  setText("selectedFileSize", formatBytes(total));
-
-  notify(files.length + " file(s) selected.");
-}
-
-/* -------------------- DATA CHANNEL -------------------- */
+/* ---------------- DATA CHANNEL ---------------- */
 
 function setupDataChannel(channel) {
   state.channel = channel;
   channel.binaryType = "arraybuffer";
 
   channel.onopen = () => {
-    setStatus("Peer connected. Ready to transfer.");
-    show("transferDashboard", true);
+    visible("liveTransferSection", true);
+    text("transferStatus", "Connected");
+    text("transferTitle", "Ready to transfer");
+    notify("Connected. You can now send files.");
+    updateSendButton();
   };
 
   channel.onclose = () => {
-    setStatus("Peer connection closed.");
+    text("transferStatus", "Disconnected");
+    updateSendButton();
   };
 
   channel.onerror = error => {
-    console.error("Data channel error", error);
-    notify("Transfer connection error.");
+    console.error(error);
+    notify("Data channel error.");
   };
 
   channel.onmessage = event => {
-    handleIncomingMessage(event.data);
+    receiveMessage(event.data);
   };
 }
 
-function handleIncomingMessage(data) {
+/* ---------------- FILE SELECTION ---------------- */
+
+function selectFiles(event) {
+  state.selectedFiles = Array.from(event.target.files || []);
+
+  const container = $("selectedFiles");
+  container.replaceChildren();
+
+  if (!state.selectedFiles.length) {
+    updateSendButton();
+    return;
+  }
+
+  const total = state.selectedFiles.reduce(
+    (sum, file) => sum + file.size,
+    0
+  );
+
+  state.selectedFiles.forEach(file => {
+    const item = document.createElement("div");
+    item.textContent = `${file.name} — ${bytes(file.size)}`;
+    container.appendChild(item);
+  });
+
+  const summary = document.createElement("p");
+  summary.textContent =
+    `${state.selectedFiles.length} file(s), total ${bytes(total)}`;
+
+  container.appendChild(summary);
+
+  updateSendButton();
+  updateCompressionEstimate();
+}
+
+function updateSendButton() {
+  const button = $("sendFilesButton");
+
+  if (button) {
+    button.disabled = !(
+      state.selectedFiles.length &&
+      state.profile &&
+      navigator.onLine
+    );
+  }
+}
+
+function updateCompressionEstimate() {
+  const selected = state.selectedFiles;
+  if (!selected.length) {
+    visible("compressionResult", false);
+    return;
+  }
+
+  const total = selected.reduce((sum, file) => sum + file.size, 0);
+  text("originalFileSize", bytes(total));
+  text("estimatedFileSize", "Not available");
+
+  visible("compressionResult", true);
+}
+
+/* ---------------- SEND FILES ---------------- */
+
+async function sendFiles() {
+  if (!state.selectedFiles.length) {
+    notify("Choose files first.");
+    return;
+  }
+
+  const receiver = state.targetUser || await lookupReceiver();
+
+  if (!receiver) return;
+
+  const total = state.selectedFiles.reduce(
+    (sum, file) => sum + file.size,
+    0
+  );
+
+  if (total > MAX_FILE_SIZE) {
+    notify("This version supports up to 100 MB total per transfer.");
+    return;
+  }
+
+  if (!state.channel || state.channel.readyState !== "open") {
+    await createConnectionRequest(receiver);
+    notify("Accept the request on the receiver's device. Transfer will be ready after connection.");
+    return;
+  }
+
+  await transmitFiles();
+}
+
+async function waitForChannelBuffer(channel) {
+  while (
+    channel.readyState === "open" &&
+    channel.bufferedAmount > BUFFER_LIMIT
+  ) {
+    await new Promise(resolve => setTimeout(resolve, 40));
+  }
+
+  if (channel.readyState !== "open") {
+    throw new Error("Connection closed.");
+  }
+}
+
+async function transmitFiles() {
+  const channel = state.channel;
+  if (!channel || channel.readyState !== "open") {
+    notify("No active receiver connection.");
+    return;
+  }
+
+  state.sending = true;
+  state.paused = false;
+  state.cancelled = false;
+  state.startedAt = Date.now();
+
+  state.totalBytes = state.selectedFiles.reduce(
+    (sum, file) => sum + file.size, 0
+  );
+
+  state.transferredBytes = 0;
+
+  visible("liveTransferSection", true);
+  text("transferTitle", "Sending files");
+  text("transferStatus", "Transferring");
+
+  try {
+    for (const file of state.selectedFiles) {
+      if (state.cancelled) break;
+
+      channel.send(JSON.stringify({
+        type: "file-start",
+        name: file.name,
+        size: file.size,
+        mime: file.type || "application/octet-stream"
+      }));
+
+      for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
+        while (state.paused && !state.cancelled) {
+          await new Promise(resolve => setTimeout(resolve, 150));
+        }
+
+        if (state.cancelled) break;
+
+        await waitForChannelBuffer(channel);
+
+        const chunk = await file.slice(
+          offset,
+          Math.min(offset + CHUNK_SIZE, file.size)
+        ).arrayBuffer();
+
+        channel.send(chunk);
+        state.transferredBytes += chunk.byteLength;
+        updateTransferStats();
+      }
+
+      if (!state.cancelled) {
+        channel.send(JSON.stringify({ type: "file-end" }));
+      }
+    }
+
+    if (state.cancelled) {
+      notify("Transfer cancelled.");
+    } else {
+      text("transferStatus", "Completed");
+      text("transferTitle", "Transfer completed");
+      await saveHistory("sent", state.totalBytes);
+      notify("Files sent successfully.");
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.sending = false;
+    state.paused = false;
+  }
+}
+
+/* ---------------- RECEIVE FILES ---------------- */
+
+function receiveMessage(data) {
   if (typeof data === "string") {
     let message;
 
@@ -808,31 +985,37 @@ function handleIncomingMessage(data) {
       state.currentFile = {
         name: String(message.name || "received-file")
           .replace(/[\\/:*?"<>|]/g, "_"),
-        type: String(message.mime || "application/octet-stream")
+        mime: message.mime || "application/octet-stream"
       };
 
-      setText("transferStatus", "Receiving " + state.currentFile.name);
-      setText("transferProgress", "0%");
+      visible("liveTransferSection", true);
+      text("transferTitle", "Receiving " + state.currentFile.name);
+      text("transferStatus", "Receiving");
+      updateReceiveStats();
       return;
     }
 
     if (message.type === "file-end") {
-      finishReceivingFile();
+      finishReceivedFile();
       return;
     }
 
     if (message.type === "cancel") {
       state.receivedChunks = [];
       state.receivedBytes = 0;
+      text("transferStatus", "Cancelled");
       notify("Sender cancelled the transfer.");
       return;
     }
 
-    if (message.type === "ping") {
-      state.channel?.send(JSON.stringify({
-        type: "pong",
-        time: message.time
-      }));
+    if (message.type === "pause") {
+      text("transferStatus", "Sender paused");
+      return;
+    }
+
+    if (message.type === "resume") {
+      text("transferStatus", "Receiving");
+      return;
     }
 
     return;
@@ -841,335 +1024,262 @@ function handleIncomingMessage(data) {
   if (data instanceof ArrayBuffer) {
     state.receivedChunks.push(data);
     state.receivedBytes += data.byteLength;
-
-    const percent = state.expectedBytes
-      ? Math.min(
-          100,
-          (state.receivedBytes / state.expectedBytes) * 100
-        )
-      : 0;
-
-    updateProgress(percent, state.receivedBytes, state.expectedBytes);
+    updateReceiveStats();
   }
 }
 
-function finishReceivingFile() {
+function finishReceivedFile() {
   if (!state.currentFile) return;
 
   const blob = new Blob(state.receivedChunks, {
-    type: state.currentFile.type
+    type: state.currentFile.mime
   });
 
   const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
+  const anchor = document.createElement("a");
 
-  link.href = url;
-  link.download = state.currentFile.name;
-  link.style.display = "none";
+  anchor.href = url;
+  anchor.download = state.currentFile.name;
+  anchor.style.display = "none";
 
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
 
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+  const receivedSize = state.receivedBytes;
 
   state.receivedChunks = [];
   state.receivedBytes = 0;
   state.expectedBytes = 0;
   state.currentFile = null;
 
-  notify("File received. Download started.");
+  text("transferStatus", "Completed");
+  text("transferTitle", "File received");
+  saveHistory("received", receivedSize);
+
+  notify("File received. Download should begin.");
 }
 
-/* -------------------- SENDING FILES -------------------- */
+/* ---------------- PROGRESS ---------------- */
 
-async function waitForBuffer(channel) {
-  while (
-    channel.readyState === "open" &&
-    channel.bufferedAmount > MAX_BUFFERED_AMOUNT
-  ) {
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
+function updateTransferStats() {
+  const done = state.transferredBytes;
+  const total = state.totalBytes;
+  const elapsed = Math.max(0.1, (Date.now() - state.startedAt) / 1000);
+  const speed = done / elapsed;
+  const remaining = speed > 0 ? (total - done) / speed : 0;
+  const percent = total ? done / total * 100 : 0;
 
-  if (channel.readyState !== "open") {
-    throw new Error("Connection closed during transfer.");
-  }
+  text("dataTransferred", bytes(done));
+  text("transferSpeed", bytes(speed) + "/s");
+  text("remainingTime", remaining ? Math.ceil(remaining) + " sec" : "Calculating...");
+  text("transferPercentage", percent.toFixed(1) + "%");
+
+  const bar = $("transferProgressBar");
+  if (bar) bar.style.width = percent + "%";
 }
 
-async function sendSelectedFiles() {
-  const channel = state.channel;
+function updateReceiveStats() {
+  const percent = state.expectedBytes
+    ? Math.min(100, state.receivedBytes / state.expectedBytes * 100)
+    : 0;
 
-  if (!channel || channel.readyState !== "open") {
-    notify("Connect to another user first.");
+  text("dataTransferred", bytes(state.receivedBytes));
+  text("transferPercentage", percent.toFixed(1) + "%");
+
+  const bar = $("transferProgressBar");
+  if (bar) bar.style.width = percent + "%";
+}
+
+/* ---------------- PAUSE / RESUME / CANCEL ---------------- */
+
+function pauseTransfer() {
+  if (!state.sending || state.paused) {
+    notify("No active sending transfer to pause.");
     return;
   }
 
-  if (!state.selectedFiles.length) {
-    notify("Select at least one file.");
-    return;
-  }
-
-  const total = state.selectedFiles.reduce(
-    (sum, file) => sum + file.size,
-    0
-  );
-
-  state.totalBytes = total;
-  state.sentBytes = 0;
-  state.cancelled = false;
-  state.sending = true;
-  state.transferStartedAt = Date.now();
-
-  if (total > MAX_IN_MEMORY_FILE_SIZE) {
-    notify(
-      "This first version is limited to files up to 100 MB. " +
-      "Large-file disk streaming is not implemented yet."
-    );
-    state.sending = false;
-    return;
-  }
+  state.paused = true;
 
   try {
-    for (const file of state.selectedFiles) {
-      if (state.cancelled) break;
+    state.channel?.send(JSON.stringify({ type: "pause" }));
+  } catch (_) {}
 
-      channel.send(JSON.stringify({
-        type: "file-start",
-        name: file.name,
-        size: file.size,
-        mime: file.type || "application/octet-stream"
-      }));
-
-      for (
-        let offset = 0;
-        offset < file.size;
-        offset += CHUNK_SIZE
-      ) {
-        if (state.cancelled) break;
-
-        await waitForBuffer(channel);
-
-        const chunk = file.slice(
-          offset,
-          Math.min(offset + CHUNK_SIZE, file.size)
-        );
-
-        const buffer = await chunk.arrayBuffer();
-
-        channel.send(buffer);
-        state.sentBytes += buffer.byteLength;
-
-        const percent = total
-          ? (state.sentBytes / total) * 100
-          : 100;
-
-        updateProgress(percent, state.sentBytes, total);
-      }
-
-      if (!state.cancelled) {
-        channel.send(JSON.stringify({ type: "file-end" }));
-      }
-    }
-
-    if (state.cancelled) {
-      channel.send(JSON.stringify({ type: "cancel" }));
-      notify("Transfer cancelled.");
-    } else {
-      notify("All selected files sent.");
-      saveTransferHistory("sent", total);
-    }
-  } catch (error) {
-    notify("Transfer failed: " + getErrorMessage(error));
-  } finally {
-    state.sending = false;
-  }
+  visible("pauseTransferButton", false);
+  visible("resumeTransferButton", true);
+  text("transferStatus", "Paused");
 }
 
-function updateProgress(percent, transferred, total) {
-  const safePercent = Math.max(0, Math.min(100, percent));
-
-  const bar =
-    $("transferProgressBar") ||
-    $("progressBar");
-
-  if (bar) {
-    if ("value" in bar) {
-      bar.value = safePercent;
-    } else {
-      bar.style.width = safePercent + "%";
-    }
+function resumeTransfer() {
+  if (!state.sending || !state.paused) {
+    notify("No paused transfer.");
+    return;
   }
 
-  setText("transferProgress", safePercent.toFixed(1) + "%");
-  setText(
-    "transferBytes",
-    formatBytes(transferred) + " / " + formatBytes(total)
-  );
+  state.paused = false;
 
-  const elapsed = Math.max(
-    1,
-    (Date.now() - state.transferStartedAt) / 1000
-  );
+  try {
+    state.channel?.send(JSON.stringify({ type: "resume" }));
+  } catch (_) {}
 
-  const speed = transferred / elapsed;
-
-  setText("transferSpeed", formatBytes(speed) + "/s");
+  visible("pauseTransferButton", true);
+  visible("resumeTransferButton", false);
+  text("transferStatus", "Transferring");
 }
-
-/* -------------------- CANCEL -------------------- */
 
 function cancelTransfer() {
   state.cancelled = true;
+  state.paused = false;
 
-  if (state.channel?.readyState === "open") {
-    try {
+  try {
+    if (state.channel?.readyState === "open") {
       state.channel.send(JSON.stringify({ type: "cancel" }));
-    } catch (_) {}
-  }
+    }
+  } catch (_) {}
 
-  setStatus("Cancelling transfer...");
+  text("transferStatus", "Cancelling");
 }
 
-/* -------------------- TRANSFER HISTORY -------------------- */
+/* ---------------- HISTORY ---------------- */
 
-async function saveTransferHistory(direction, bytes) {
+async function saveHistory(direction, size) {
   if (!state.user) return;
 
   try {
-    const historyRef = push(
+    const itemRef = push(
       ref(rtdb, `${ROOT}/history/${state.user.uid}`)
     );
 
-    await set(historyRef, {
+    await set(itemRef, {
       direction,
-      bytes,
+      size,
       createdAt: Date.now()
     });
+
+    loadHistory();
   } catch (error) {
-    console.warn("History could not be saved:", error);
+    console.warn("History save failed:", error);
   }
 }
 
-async function loadTransferHistory() {
+async function loadHistory() {
   if (!state.user) return;
+
+  const container = $("transferHistory");
 
   try {
     const snapshot = await get(
       ref(rtdb, `${ROOT}/history/${state.user.uid}`)
     );
 
-    const container =
-      $("transferHistory") ||
-      $("historyList");
-
-    if (!container) return;
-
     container.replaceChildren();
 
     if (!snapshot.exists()) {
-      container.textContent = "No transfer history yet.";
+      const empty = document.createElement("p");
+      empty.className = "empty-state";
+      empty.textContent = "Your completed transfers will appear here.";
+      container.appendChild(empty);
       return;
     }
 
-    const history = Object.values(snapshot.val())
+    const entries = Object.values(snapshot.val())
       .sort((a, b) => b.createdAt - a.createdAt);
 
-    history.forEach(item => {
+    entries.forEach(item => {
       const row = document.createElement("div");
+      row.className = "history-item";
       row.textContent =
-        `${item.direction} · ${formatBytes(item.bytes)} · ` +
-        new Date(item.createdAt).toLocaleString();
+        `${item.direction === "sent" ? "Sent" : "Received"} · ` +
+        `${bytes(item.size)} · ` +
+        `${new Date(item.createdAt).toLocaleString()}`;
 
       container.appendChild(row);
     });
   } catch (error) {
-    notify("Could not load history: " + getErrorMessage(error));
+    console.warn("History load failed:", error);
   }
 }
 
-/* -------------------- DISCONNECT -------------------- */
+async function clearHistory() {
+  if (!state.user) return;
+
+  if (!confirm("Clear your DataLite transfer history?")) return;
+
+  try {
+    await remove(
+      ref(rtdb, `${ROOT}/history/${state.user.uid}`)
+    );
+
+    await loadHistory();
+    notify("Transfer history cleared.");
+  } catch (error) {
+    showError(error);
+  }
+}
+
+/* ---------------- DISCONNECT / LOGOUT ---------------- */
 
 async function closePeer() {
-  try {
-    if (state.channel) {
-      state.channel.close();
-    }
+  state.candidateUnsubscribers.forEach(unsubscribe => {
+    try { unsubscribe(); } catch (_) {}
+  });
 
-    if (state.peer) {
-      state.peer.close();
-    }
-  } catch (_) {}
+  state.candidateUnsubscribers = [];
+
+  try { state.channel?.close(); } catch (_) {}
+  try { state.peer?.close(); } catch (_) {}
 
   state.channel = null;
   state.peer = null;
-  state.activeRequestId = null;
-  state.activeRole = null;
-  state.sending = false;
+  state.requestId = null;
+  state.role = null;
 }
-
-async function disconnectPeer() {
-  const requestId = state.activeRequestId;
-
-  await closePeer();
-
-  if (requestId) {
-    try {
-      await update(
-        ref(rtdb, `${ROOT}/requests/${requestId}`),
-        { status: "closed", closedAt: Date.now() }
-      );
-    } catch (_) {}
-  }
-
-  setStatus("Disconnected.");
-}
-
-/* -------------------- LOGOUT -------------------- */
 
 async function logout() {
   try {
     await closePeer();
 
-    if (state.unsubscribePresence) {
-      state.unsubscribePresence();
-    }
+    state.presenceUnsubscribe?.();
+    state.requestUnsubscribe?.();
 
-    if (state.unsubscribeRequests) {
-      state.unsubscribeRequests();
+    if (state.user) {
+      await remove(
+        ref(rtdb, `${ROOT}/presence/${state.user.uid}`)
+      );
     }
 
     await signOut(auth);
-    notify("Logged out.");
+
+    state.user = null;
+    state.profile = null;
+
+    visible("registeredIdentity", false);
+    visible("guestIdentity", true);
+    text("userStatus", "Offline");
+    status("Logged out");
+
+    notify("You have been logged out.");
   } catch (error) {
-    notify(getErrorMessage(error));
+    showError(error);
   }
 }
 
-/* -------------------- CAMERA QR SCANNER -------------------- */
+/* ---------------- QR SCANNER ---------------- */
 
 let cameraStream = null;
-let scanTimer = null;
+let scanInterval = null;
 
-async function startQRScanner() {
-  const video = $("cameraPreview");
-
-  if (!video) {
-    notify("Camera preview element not found.");
-    return;
-  }
-
+async function scanQR() {
   if (!("BarcodeDetector" in window)) {
-    notify(
-      "QR scanning is not supported by this browser. " +
-      "Use your phone camera to scan the QR code."
-    );
+    notify("QR scanning is not supported in this browser. Enter the ID manually.");
     return;
   }
 
   try {
-    const detector = new BarcodeDetector({
-      formats: ["qr_code"]
-    });
+    const video = $("cameraPreview");
+    const detector = new BarcodeDetector({ formats: ["qr_code"] });
 
     cameraStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "environment" },
@@ -1177,211 +1287,248 @@ async function startQRScanner() {
     });
 
     video.srcObject = cameraStream;
+    video.hidden = false;
     await video.play();
 
-    show("cameraPreview", true);
+    const scanner = $("qrScanner");
+    scanner.replaceChildren();
 
-    scanTimer = setInterval(async () => {
+    const message = document.createElement("p");
+    message.textContent = "Point your camera at a DataLite QR code.";
+    scanner.appendChild(message);
+    visible("qrScanner", true);
+
+    scanInterval = setInterval(async () => {
       if (video.readyState < 2) return;
 
       try {
         const codes = await detector.detect(video);
 
         if (codes.length) {
-          const value = codes[0].rawValue;
-          setValue("userSearchInput", value);
+          const value = codes[0].rawValue.trim();
+
+          $("searchUserInput").value = value;
           stopQRScanner();
-          notify("QR code detected: " + value);
+          searchUser();
+
+          notify("QR code scanned.");
         }
       } catch (error) {
         console.warn(error);
       }
     }, 700);
   } catch (error) {
-    notify("Camera error: " + getErrorMessage(error));
+    showError(error);
   }
 }
 
 function stopQRScanner() {
-  if (scanTimer) clearInterval(scanTimer);
-  scanTimer = null;
+  if (scanInterval) clearInterval(scanInterval);
+  scanInterval = null;
 
-  if (cameraStream) {
-    cameraStream.getTracks().forEach(track => track.stop());
-  }
-
+  cameraStream?.getTracks().forEach(track => track.stop());
   cameraStream = null;
 
   const video = $("cameraPreview");
-  if (video) video.srcObject = null;
+  if (video) {
+    video.srcObject = null;
+    video.hidden = true;
+  }
+
+  visible("qrScanner", false);
 }
 
-/* -------------------- BUTTON BINDINGS -------------------- */
+/* ---------------- MENU AND NAVIGATION ---------------- */
 
-function bind(id, event, handler) {
-  const element = $(id);
-  if (element) {
-    element.addEventListener(event, handler);
+function toggleMenu() {
+  const panel = $("menuPanel");
+  if (panel) panel.hidden = !panel.hidden;
+}
+
+function closeMenu() {
+  visible("menuPanel", false);
+}
+
+function menuNavigate(target) {
+  closeMenu();
+  scrollTo(target);
+}
+
+function startSending() {
+  scrollTo("transferSection");
+  $("fileInput")?.click();
+}
+
+function receiveFiles() {
+  scrollTo("incomingRequestSection");
+
+  if (!state.incoming) {
+    notify("Waiting for someone to send you a connection request.");
   }
 }
 
-function bindFirst(ids, event, handler) {
-  for (const id of ids) {
-    const element = $(id);
-
-    if (element) {
-      element.addEventListener(event, handler);
-      return;
-    }
-  }
+function connectWorldwide() {
+  scrollTo("userSearchSection");
+  $("searchUserInput")?.focus();
+  notify("Search for a DataLite username or unique ID.");
 }
 
-function setupUI() {
-  bindFirst(
-    ["fileInput", "fileUploadInput", "selectFiles"],
-    "change",
-    handleFileSelection
-  );
+function nearbySharing() {
+  const panel = $("nearbyDevices");
+  visible("nearbyDevices", true);
 
-  bindFirst(
-    ["sendFileButton", "sendButton", "startTransferButton"],
-    "click",
-    sendSelectedFiles
-  );
-
-  bindFirst(
-    ["cancelTransferButton", "cancelButton"],
-    "click",
-    cancelTransfer
-  );
-
-  bindFirst(
-    ["searchUserButton", "searchButton"],
-    "click",
-    searchUsers
-  );
-
-  bindFirst(
-    ["updateUsernameButton", "saveUsernameButton"],
-    "click",
-    changeUsername
-  );
-
-  bindFirst(
-    ["disconnectButton", "endConnectionButton"],
-    "click",
-    disconnectPeer
-  );
-
-  bindFirst(
-    ["logoutButton", "signOutButton"],
-    "click",
-    logout
-  );
-
-  bindFirst(
-    ["scanQRButton", "startScanButton"],
-    "click",
-    startQRScanner
-  );
-
-  bindFirst(
-    ["stopScanButton"],
-    "click",
-    stopQRScanner
-  );
-
-  bindFirst(
-    ["historyButton", "viewHistoryButton"],
-    "click",
-    loadTransferHistory
-  );
-
-  bindFirst(
-    ["globalShareButton"],
-    "click",
-    () => {
-      const searchInput = $("userSearchInput");
-      if (searchInput?.value) {
-        searchUsers();
-      } else {
-        notify("Enter a username to find someone.");
-      }
-    }
-  );
-
-  bindFirst(
-    ["nearbyShareButton", "nearbyButton"],
-    "click",
-    () => {
-      notify(
-        "Browser-based nearby Wi-Fi Direct is not available. " +
-        "This feature needs a native Android implementation."
-      );
-    }
-  );
-
-  bindFirst(
-    ["compressionSelect", "compressionMode"],
-    "change",
-    () => {
-      notify(
-        "Compression engine is not included in this version. " +
-        "Files are sent unchanged."
-      );
-    }
-  );
-
-  bind("userSearchInput", "keydown", event => {
-    if (event.key === "Enter") searchUsers();
-  });
-
-  bind("searchUserInput", "keydown", event => {
-    if (event.key === "Enter") searchUsers();
-  });
-
-  if ("Notification" in window &&
-      Notification.permission === "default") {
-    Notification.requestPermission().catch(() => {});
+  if (panel) {
+    panel.textContent =
+      "Nearby Wi-Fi Direct sharing requires a native Android app. " +
+      "This browser version cannot discover nearby devices without internet.";
   }
+
+  notify("Native Android nearby sharing is not available in this web version.");
 }
 
-/* -------------------- START APPLICATION -------------------- */
+/* ---------------- SHARE LINKS / COMPRESSION ---------------- */
 
-async function startApp() {
-  setupUI();
+function explainShareLink() {
+  notify(
+    "Temporary share links are not enabled yet. " +
+    "Secure link creation needs additional server-side authorization."
+  );
+}
 
-  if (!navigator.onLine) {
-    setStatus("Internet connection required for global sharing.");
-  }
+function revokeShareLink() {
+  notify("No active share link exists to revoke.");
+}
 
-  if (!window.isSecureContext) {
-    console.warn(
-      "DataLite Share requires HTTPS for camera and WebRTC features."
+function copyShareLink() {
+  notify("No share link has been generated.");
+}
+
+function compressionChanged() {
+  const mode = document.querySelector(
+    'input[name="compressionMode"]:checked'
+  )?.value || "original";
+
+  if (mode === "original") {
+    notify("Original Quality selected. Files will be sent unchanged.");
+  } else {
+    notify(
+      "Compression engine is not installed yet. " +
+      "Files will still be sent unchanged."
     );
   }
 
-  if ("serviceWorker" in navigator) {
-    try {
-      await navigator.serviceWorker.register("./service-worker.js");
-    } catch (error) {
-      console.warn("Service worker registration failed:", error);
-    }
-  }
-
-  try {
-    await authenticate();
-  } catch (error) {
-    setStatus("Firebase login failed: " + getErrorMessage(error));
-  }
+  updateCompressionEstimate();
 }
 
+/* ---------------- BUTTON EVENTS ---------------- */
+
+function bindEvents() {
+  $("createIdentityForm")?.addEventListener("submit", createIdentity);
+  $("userSearchForm")?.addEventListener("submit", searchUser);
+
+  $("menuButton")?.addEventListener("click", toggleMenu);
+  $("startSendingButton")?.addEventListener("click", startSending);
+  $("receiveButton")?.addEventListener("click", receiveFiles);
+
+  $("nearbyShareButton")?.addEventListener("click", nearbySharing);
+  $("globalShareButton")?.addEventListener("click", connectWorldwide);
+
+  $("copyUserCodeButton")?.addEventListener("click", copyUserCode);
+  $("shareQrButton")?.addEventListener("click", shareQR);
+
+  $("scanQrButton")?.addEventListener("click", scanQR);
+
+  $("fileInput")?.addEventListener("change", selectFiles);
+  $("sendFilesButton")?.addEventListener("click", sendFiles);
+
+  $("acceptTransferButton")?.addEventListener(
+    "click",
+    acceptIncomingRequest
+  );
+
+  $("rejectTransferButton")?.addEventListener(
+    "click",
+    rejectIncomingRequest
+  );
+
+  $("pauseTransferButton")?.addEventListener("click", pauseTransfer);
+  $("resumeTransferButton")?.addEventListener("click", resumeTransfer);
+  $("cancelTransferButton")?.addEventListener("click", cancelTransfer);
+
+  $("clearHistoryButton")?.addEventListener("click", clearHistory);
+
+  $("profileMenuButton")?.addEventListener("click", () => {
+    closeMenu();
+    scrollTo("identitySection");
+  });
+
+  $("historyMenuButton")?.addEventListener("click", () => {
+    menuNavigate("historySection");
+    loadHistory();
+  });
+
+  $("settingsMenuButton")?.addEventListener("click", () => {
+    closeMenu();
+    scrollTo("transferSection");
+  });
+
+  $("logoutButton")?.addEventListener("click", logout);
+
+  $("copyShareLinkButton")?.addEventListener("click", copyShareLink);
+  $("revokeShareLinkButton")?.addEventListener("click", revokeShareLink);
+
+  document.querySelectorAll('input[name="compressionMode"]')
+    .forEach(input => {
+      input.addEventListener("change", compressionChanged);
+    });
+
+  $("receiverCodeInput")?.addEventListener("change", lookupReceiver);
+
+  $("fileDropArea")?.addEventListener("dragover", event => {
+    event.preventDefault();
+  });
+
+  $("fileDropArea")?.addEventListener("drop", event => {
+    event.preventDefault();
+
+    const files = Array.from(event.dataTransfer?.files || []);
+    state.selectedFiles = files;
+
+    const transfer = new DataTransfer();
+    files.forEach(file => transfer.items.add(file));
+
+    $("fileInput").files = transfer.files;
+
+    selectFiles({ target: $("fileInput") });
+  });
+
+  document.addEventListener("click", event => {
+    const panel = $("menuPanel");
+    const button = $("menuButton");
+
+    if (
+      panel &&
+      !panel.hidden &&
+      !panel.contains(event.target) &&
+      !button?.contains(event.target)
+    ) {
+      closeMenu();
+    }
+  });
+
+  text("currentYear", new Date().getFullYear());
+}
+
+/* ---------------- NETWORK EVENTS ---------------- */
+
 window.addEventListener("online", () => {
-  setStatus("Internet connection restored.");
+  status("Internet restored");
+  updateSendButton();
 });
 
 window.addEventListener("offline", () => {
-  setStatus("Internet connection lost.");
+  status("Offline");
+  updateSendButton();
 });
 
 window.addEventListener("beforeunload", () => {
@@ -1389,4 +1536,13 @@ window.addEventListener("beforeunload", () => {
   closePeer();
 });
 
-startApp();
+/* ---------------- START ---------------- */
+
+bindEvents();
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("./service-worker.js")
+    .catch(error => console.warn("Service worker:", error));
+}
+
+initializeAccount();
