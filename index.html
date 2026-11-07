@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#080D19">
+  <meta name="description" content="DataLite Share - Fast, secure file sharing. Transfer files nearby without internet or globally using peer-to-peer technology.">
+  <meta name="keywords" content="DataLite Share, file sharing, offline file transfer, online file transfer, P2P, fast file sharing">
+  <meta name="robots" content="index, follow">
+  <meta name="author" content="DataLite Share">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="DataLite Share - Fast File Sharing">
+  <meta property="og:description" content="Share files nearby or across the world with DataLite Share.">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://YOUR-GITHUB-USERNAME.github.io/datalite-share/">
+  <link rel="manifest" href="./manifest.json">
+  <link rel="icon" href="./favicon.ico">
+  <link rel="stylesheet" href="./style.css">
+  <title>DataLite Share - Fast, Secure File Sharing</title>
+</head>
+
+<body>
+  <div class="app-shell">
+
+    <!-- HEADER -->
+    <header class="app-header">
+      <a class="brand" href="./" aria-label="DataLite Share Home">
+        <span class="brand-icon">D</span>
+        <span>DataLite<span class="brand-accent">Share</span></span>
+      </a>
+
+      <div class="header-actions">
+        <span class="connection-indicator" id="networkStatus">
+          <span class="status-dot"></span>
+          Checking network
+        </span>
+        <button class="icon-button" id="menuButton" aria-label="Open menu">
+          ☰
+        </button>
+      </div>
+    </header>
+
+    <main>
+
+      <!-- HERO -->
+      <section class="hero-section">
+        <div class="hero-badge">
+          <span class="status-dot"></span>
+          FAST • SECURE • GLOBAL
+        </div>
+
+        <h1>Share Files.<br>
+          <span class="gradient-text">Without Limits.</span>
+        </h1>
+
+        <p class="hero-description">
+          Send files nearby without mobile internet or connect
+          with anyone around the world.
+        </p>
+
+        <div class="hero-actions">
+          <button class="primary-button" id="startSendingButton">
+            ↑ Send Files
+          </button>
+          <button class="secondary-button" id="receiveButton">
+            ↓ Receive Files
+          </button>
+        </div>
+
+        <div class="feature-highlights">
+          <span>⚡ High Speed</span>
+          <span>🔒 Secure Transfer</span>
+          <span>☁ No Cloud File Storage</span>
+        </div>
+      </section>
+
+      <!-- AD PLACEMENT -->
+      <section class="ad-container" id="topAdContainer" aria-label="Advertisement">
+        <span class="ad-label">ADVERTISEMENT</span>
+        <div id="topAdSlot"></div>
+      </section>
+
+      <!-- USER IDENTITY -->
+      <section class="section-card identity-section" id="identitySection">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">YOUR IDENTITY</span>
+            <h2>Your DataLite ID</h2>
+          </div>
+          <span class="online-badge" id="userStatus">Offline</span>
+        </div>
+
+        <div id="guestIdentity" class="identity-content">
+          <p>Create your unique identity to connect with people worldwide.</p>
+
+          <form id="createIdentityForm">
+            <label for="usernameInput">Choose your username</label>
+            <div class="input-group">
+              <input
+                type="text"
+                id="usernameInput"
+                name="username"
+                placeholder="e.g. venkat123"
+                minlength="3"
+                maxlength="20"
+                autocomplete="username"
+                pattern="[a-zA-Z0-9_]+"
+                required
+              >
+              <button type="submit" id="createIdentityButton">
+                Create ID
+              </button>
+            </div>
+            <small>3–20 characters. Letters, numbers and underscores only.</small>
+          </form>
+        </div>
+
+        <div id="registeredIdentity" class="identity-content" hidden>
+          <div class="user-id-display">
+            <div>
+              <span class="eyebrow">YOUR UNIQUE CODE</span>
+              <h3 id="displayUserCode">Not connected</h3>
+              <p id="displayUsername">@username</p>
+            </div>
+            <div class="qr-wrapper" id="userQrCode">
+              <span>QR Code</span>
+            </div>
+          </div>
+
+          <div class="identity-actions">
+            <button class="secondary-button" id="copyUserCodeButton">
+              Copy ID
+            </button>
+            <button class="secondary-button" id="shareQrButton">
+              Share QR
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- SHARING MODES -->
+      <section class="sharing-section" id="sharingSection">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">CHOOSE YOUR CONNECTION</span>
+            <h2>How do you want to share?</h2>
+          </div>
+        </div>
+
+        <div class="mode-grid">
+
+          <article class="mode-card offline-card">
+            <div class="mode-icon">📡</div>
+            <span class="mode-label">NEARBY TRANSFER</span>
+            <h3>Offline Sharing</h3>
+            <p>
+              Transfer files directly between nearby devices
+              using a local wireless connection.
+            </p>
+            <ul>
+              <li>No mobile internet required</li>
+              <li>Original file quality</li>
+              <li>Fast local transfer</li>
+            </ul>
+            <button class="primary-button" id="nearbyShareButton">
+              Find Nearby Devices
+            </button>
+            <div id="nearbyDevices" class="device-list" hidden></div>
+          </article>
+
+          <article class="mode-card online-card">
+            <div class="mode-icon">🌍</div>
+            <span class="mode-label">WORLDWIDE TRANSFER</span>
+            <h3>Global Sharing</h3>
+            <p>
+              Connect with users anywhere in the world
+              using their unique DataLite ID.
+            </p>
+            <ul>
+              <li>Worldwide peer-to-peer transfer</li>
+              <li>Unique ID connection</li>
+              <li>24-hour live sharing links</li>
+            </ul>
+            <button class="primary-button" id="globalShareButton">
+              Connect Worldwide
+            </button>
+          </article>
+
+        </div>
+      </section>
+
+      <!-- USER SEARCH -->
+      <section class="section-card" id="userSearchSection">
+        <span class="eyebrow">CONNECT WITH PEOPLE</span>
+        <h2>Find a DataLite User</h2>
+
+        <form id="userSearchForm">
+          <label for="searchUserInput">Username or unique code</label>
+          <div class="input-group">
+            <input
+              type="text"
+              id="searchUserInput"
+              placeholder="Enter DataLite ID"
+              maxlength="40"
+              required
+            >
+            <button type="submit" id="searchUserButton">Search</button>
+          </div>
+        </form>
+
+        <div class="scan-divider"><span>OR</span></div>
+
+        <button class="secondary-button full-width" id="scanQrButton">
+          ▦ Scan QR Code
+        </button>
+
+        <div id="searchResults" class="search-results" aria-live="polite"></div>
+        <div id="qrScanner" hidden></div>
+      </section>
+
+      <!-- FILE TRANSFER -->
+      <section class="section-card transfer-section" id="transferSection">
+        <span class="eyebrow">FILE TRANSFER</span>
+        <h2>Send Your Files</h2>
+        <p>Select files to share with your connected receiver.</p>
+
+        <label class="file-drop-area" for="fileInput" id="fileDropArea">
+          <span class="upload-icon">↑</span>
+          <strong>Choose files or drop them here</strong>
+          <span>Photos, videos, documents and other files</span>
+          <span class="file-size-note">Large files supported subject to device and browser limits</span>
+        </label>
+
+        <input
+          type="file"
+          id="fileInput"
+          multiple
+          hidden
+        >
+
+        <div id="selectedFiles" class="selected-files" aria-live="polite"></div>
+
+        <!-- COMPRESSION SETTINGS -->
+        <div class="compression-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">SMART TECHNOLOGY</span>
+              <h3>Compression Settings</h3>
+            </div>
+          </div>
+
+          <label class="option-row">
+            <input type="radio" name="compressionMode" value="original" checked>
+            <span>
+              <strong>Original Quality</strong>
+              <small>Send without modifying the original file.</small>
+            </span>
+          </label>
+
+          <label class="option-row">
+            <input type="radio" name="compressionMode" value="smart">
+            <span>
+              <strong>Smart Compression</strong>
+              <small>Optimize supported files while preserving quality as much as possible.</small>
+            </span>
+          </label>
+
+          <label class="option-row">
+            <input type="radio" name="compressionMode" value="maximum">
+            <span>
+              <strong>Maximum Compression</strong>
+              <small>Prioritize smaller files. Quality may change for media files.</small>
+            </span>
+          </label>
+
+          <div class="compression-result" id="compressionResult" hidden>
+            <span>Original size</span>
+            <strong id="originalFileSize">0 MB</strong>
+            <span>Estimated compressed size</span>
+            <strong id="estimatedFileSize">Calculating...</strong>
+            <small>Actual compression results depend on file type.</small>
+          </div>
+        </div>
+
+        <!-- RECEIVER -->
+        <div class="receiver-panel">
+          <label for="receiverCodeInput">Receiver DataLite ID</label>
+          <input
+            type="text"
+            id="receiverCodeInput"
+            placeholder="Enter receiver's unique code"
+            maxlength="40"
+          >
+          <p id="receiverStatus" aria-live="polite">
+            No receiver selected.
+          </p>
+        </div>
+
+        <div class="transfer-actions">
+          <button class="primary-button full-width" id="sendFilesButton" disabled>
+            Send Files
+          </button>
+        </div>
+      </section>
+
+      <!-- INCOMING REQUEST -->
+      <section class="section-card" id="incomingRequestSection" hidden>
+        <span class="eyebrow">INCOMING REQUEST</span>
+        <h2>Someone wants to send you files</h2>
+        <div id="incomingRequestDetails"></div>
+        <div class="button-row">
+          <button class="primary-button" id="acceptTransferButton">
+            Accept
+          </button>
+          <button class="secondary-button" id="rejectTransferButton">
+            Reject
+          </button>
+        </div>
+      </section>
+
+      <!-- LIVE TRANSFER DASHBOARD -->
+      <section class="section-card live-transfer-section" id="liveTransferSection" hidden>
+        <span class="eyebrow">LIVE TRANSFER</span>
+
+        <div class="section-heading">
+          <h2 id="transferTitle">Transferring Files</h2>
+          <span class="online-badge" id="transferStatus">Connecting</span>
+        </div>
+
+        <div id="activeTransfers" aria-live="polite"></div>
+
+        <div class="transfer-stat-grid">
+          <div class="stat-card">
+            <span>Data Transferred</span>
+            <strong id="dataTransferred">0 MB</strong>
+          </div>
+          <div class="stat-card">
+            <span>Transfer Speed</span>
+            <strong id="transferSpeed">0 MB/s</strong>
+          </div>
+          <div class="stat-card">
+            <span>Remaining</span>
+            <strong id="remainingTime">Calculating...</strong>
+          </div>
+          <div class="stat-card">
+            <span>Progress</span>
+            <strong id="transferPercentage">0%</strong>
+          </div>
+        </div>
+
+        <div class="progress-track">
+          <div class="progress-fill" id="transferProgressBar"></div>
+        </div>
+
+        <div class="button-row">
+          <button class="secondary-button" id="pauseTransferButton">
+            Pause
+          </button>
+          <button class="secondary-button" id="resumeTransferButton" hidden>
+            Resume
+          </button>
+          <button class="danger-button" id="cancelTransferButton">
+            Cancel
+          </button>
+        </div>
+      </section>
+
+      <!-- UNIVERSAL SHARE LINK -->
+      <section class="section-card" id="shareLinkSection">
+        <span class="eyebrow">UNIVERSAL SHARING</span>
+        <h2>Share with Anyone</h2>
+        <p>
+          Generate a temporary live transfer link.
+          The sender must remain online for the receiver to download.
+        </p>
+
+        <div id="generatedShareLink" hidden>
+          <label for="shareLinkOutput">Your share link</label>
+          <div class="input-group">
+            <input id="shareLinkOutput" type="text" readonly>
+            <button id="copyShareLinkButton">Copy</button>
+          </div>
+          <p>Expires in: <strong id="shareLinkExpiry">24 hours</strong></p>
+          <button class="secondary-button" id="revokeShareLinkButton">
+            Revoke Link
+          </button>
+        </div>
+      </section>
+
+      <!-- TRANSFER HISTORY -->
+      <section class="section-card" id="historySection">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">YOUR ACTIVITY</span>
+            <h2>Transfer History</h2>
+          </div>
+          <button class="text-button" id="clearHistoryButton">
+            Clear
+          </button>
+        </div>
+        <div id="transferHistory">
+          <p class="empty-state">Your completed transfers will appear here.</p>
+        </div>
+      </section>
+
+      <!-- AD PLACEMENT -->
+      <section class="ad-container" id="bottomAdContainer" aria-label="Advertisement">
+        <span class="ad-label">ADVERTISEMENT</span>
+        <div id="bottomAdSlot"></div>
+      </section>
+
+      <!-- PRIVACY -->
+      <section class="privacy-section">
+        <h2>Your Files. Your Privacy.</h2>
+        <p>
+          Direct peer-to-peer file transfer is the primary sharing method.
+          Files are not intentionally uploaded to cloud file storage.
+        </p>
+        <div class="privacy-features">
+          <span>🔒 Encrypted Connections</span>
+          <span>⚡ Direct Transfer</span>
+          <span>🛡️ Protected Identity</span>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="app-footer">
+      <a class="brand" href="./">
+        <span class="brand-icon">D</span>
+        <span>DataLite<span class="brand-accent">Share</span></span>
+      </a>
+
+      <p>Fast. Secure. Global.</p>
+
+      <nav class="footer-links" aria-label="Legal links">
+        <a href="./privacy.html">Privacy Policy</a>
+        <a href="./terms.html">Terms & Conditions</a>
+        <a href="./contact.html">Contact</a>
+      </nav>
+
+      <p class="copyright">
+        © <span id="currentYear">2026</span> DataLite Share.
+        All rights reserved.
+      </p>
+    </footer>
+
+  </div>
+
+  <!-- NOTIFICATION AREA -->
+  <div id="notificationArea" role="status" aria-live="polite"></div>
+
+  <!-- APP MENU -->
+  <div class="menu-panel" id="menuPanel" hidden>
+    <button id="profileMenuButton">My Profile</button>
+    <button id="historyMenuButton">Transfer History</button>
+    <button id="settingsMenuButton">Settings</button>
+    <button id="logoutButton">Log Out</button>
+  </div>
+
+  <!-- CAMERA / QR ACCESS -->
+  <video id="cameraPreview" autoplay playsinline hidden></video>
+
+  <script type="module" src="./script.js"></script>
+</body>
+</html>
